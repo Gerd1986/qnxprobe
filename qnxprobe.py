@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.47"
+QNXPROBE_VERSION = "1.48"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -152,8 +152,9 @@ class ImagePasswordError(ImageUnreadable):
     with AD encryption, or an encrypted AFF) was opened without its password
     (``wrong`` is False) or with one that does not open it (``wrong`` is True). A
     caller that asks for the password can tell the two apart and ask again.
-    ``needs`` is "password", or "private key" for an AFF sealed only to a
-    certificate, which opens with that certificate's private key instead."""
+    ``needs`` is "password", or "private key" for an AFF or an Apple disk image
+    sealed only to a certificate, which opens with that certificate's private key
+    instead."""
 
     def __init__(self, message, wrong, needs="password"):
         super().__init__(message)
@@ -361,11 +362,19 @@ def _ad1_first(path):
     return os.path.join(folder, first) if first else None
 
 
-def _aff_needs(path):
-    """What an encrypted AFF opens with ("password" or "private key"), found by
-    opening it without either; None for an AFF that is not encrypted."""
-    if ewfprobe is None or acquisition_format(path) not in ("AFF", "AFD"):
+def _opens_with(path):
+    """What an encrypted image opens with, "password" or "private key": always a
+    password for AD encryption; for an encrypted AFF or Apple disk image, found by
+    opening it with neither, since one sealed only to a certificate asks for its
+    private key instead. None for an image that is not encrypted, or that the reader
+    refuses for another reason (which opening it will then report)."""
+    kind = acquisition_format(path)
+    if kind == "AD_ENCRYPTED":
+        return "password"
+    if kind not in ("AFF", "AFD", "DMG_ENCRYPTED"):
         return None
+    if ewfprobe is None:        # refused on opening, naming the missing reader
+        return "password" if kind == "DMG_ENCRYPTED" else None
     try:
         ewfprobe.open_ewf(path).close()
     except ewfprobe.EwfPasswordRequiredError as exc:
@@ -378,15 +387,15 @@ def _aff_needs(path):
 def needs_password(path):
     """True when path is an image that opens only with its password: an encrypted
     Apple disk image, an acquisition FTK Imager encrypted with AD encryption, or an
-    AFF encrypted with a passphrase."""
-    return (acquisition_format(path) in PASSWORD_FORMATS
-            or _aff_needs(path) == "password")
+    AFF encrypted with a passphrase. An image that a password or a certificate's
+    private key opens counts here, since either will do."""
+    return _opens_with(path) == "password"
 
 
 def needs_private_key(path):
-    """True when path is an AFF sealed only to a certificate, which opens with that
-    certificate's RSA private key rather than a password."""
-    return _aff_needs(path) == "private key"
+    """True when path is an AFF or an Apple disk image sealed only to a certificate,
+    which opens with that certificate's RSA private key rather than a password."""
+    return _opens_with(path) == "private key"
 
 
 def acquisition_format(path):
@@ -664,7 +673,8 @@ def open_image(path, segments=None, password=None, private_key=None):
     caller already has it. password opens an encrypted Apple disk image, an
     acquisition FTK Imager encrypted with AD encryption or an encrypted AFF (a str,
     used as UTF-8, or bytes), and private_key (a path to, or the bytes of, an
-    unencrypted PEM or DER RSA key) an AFF sealed to a certificate; without what
+    unencrypted PEM or DER RSA key) an AFF or an Apple disk image sealed to a
+    certificate; without what
     opens it, or with one that does not, ImagePasswordError is raised. Other
     images ignore both."""
     kind = acquisition_format(path)
@@ -13925,6 +13935,62 @@ def self_test():
                     ok = False
                 print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
+            # The same image sealed only to a certificate, built by hand as hdiutil
+            # -certificate writes the key item (unlock type 2): the 20-byte SHA-1 of
+            # the RSA public key in PKCS#1 form in a 32-byte field, algorithm 42
+            # (RSA), padding 10 (PKCS#1), a zero, the wrapped length, then the AES
+            # and HMAC keys and "CKIE\0" wrapped with RSA PKCS#1 v1.5.
+            rsa_mod = getattr(saved_reader, "_RSA", None)
+            pkcs1 = getattr(saved_reader, "_PKCS1", None)
+            if rsa_mod is None or pkcs1 is None:
+                print("  [SKIP] an image sealed to a certificate opens with its private "
+                      "key (needs the pycryptodome package)")
+            else:
+                def _der_len(n):
+                    if n < 128:
+                        return bytes([n])
+                    raw = n.to_bytes((n.bit_length() + 7) // 8, "big")
+                    return bytes([0x80 | len(raw)]) + raw
+
+                def _der_int(v):
+                    raw = v.to_bytes(v.bit_length() // 8 + 1, "big")
+                    return b"\x02" + _der_len(len(raw)) + raw
+
+                sealer, stranger = rsa_mod.generate(1024), rsa_mod.generate(1024)
+                pub = _der_int(sealer.n) + _der_int(sealer.e)
+                key_id = hashlib.sha1(b"\x30" + _der_len(len(pub)) + pub).digest()
+                wrapped = pkcs1.new(sealer.publickey()).encrypt(
+                    aes_key + hmac_key + b"CKIE\x00")
+                cert_item = (struct.pack(">L32sLLLL", 20, key_id, 42, 10, 0, len(wrapped))
+                             + wrapped.ljust(512, b"\0"))
+                cert_head = (struct.pack(">8s7L16sLQQL", b"encrcdsa", 2, 16, 5, 0x80000001,
+                                         128, 0x5B, 160, bytes(16), 512, len(enc_disk),
+                                         4096, 1)
+                             + struct.pack(">LQQ", 2, 0x60, len(cert_item)) + cert_item)
+                cert_real = os.path.join(d, "cert_real.dmg")
+                with open(cert_real, "wb") as fh:
+                    fh.write(cert_head.ljust(4096, b"\0") + body)
+
+                def _keyed(keys, passwords=()):
+                    try:
+                        with open_image_trying(cert_real, None, passwords, keys) as handle:
+                            handle.seek(0)
+                            return handle.read(len(enc_disk)) == enc_disk
+                    except ImagePasswordError as exc:
+                        return ("wrong" if exc.wrong else "required", exc.needs)
+
+                for label, cond in (
+                        ("an image sealed only to a certificate needs its private key, not "
+                         "a password, and opens with it, the first of several that does",
+                         needs_private_key(cert_real) and not needs_password(cert_real)
+                         and _keyed([]) == ("required", "private key")
+                         and _keyed([], ["a password"]) == ("required", "private key")
+                         and _keyed([stranger.export_key()]) == ("wrong", "password")
+                         and _keyed([stranger.export_key(), sealer.export_key()]) is True),):
+                    if not cond:
+                        ok = False
+                    print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
             # An AD-encrypted raw set of two files, built by hand the way FTK Imager
             # writes one, with the layout values written out again here: AES-CTR
             # with a little-endian counter, file i under i << 64, the header in the
@@ -16760,7 +16826,8 @@ if __name__ == "__main__":
                     help="a BitLocker startup key (a .BEK file), tried against every "
                          "BitLocker volume. Repeatable")
     ap.add_argument("--private-key", metavar="FILE", action="append", default=[],
-                    help="for an AFF sealed to a certificate: the certificate's RSA "
+                    help="for an AFF or an Apple disk image sealed to a certificate: the "
+                         "certificate's RSA "
                          "private key, unencrypted, as PEM or DER. Repeatable; each "
                          "image opens with the first one that opens it")
     ap.add_argument("--version", action="version",
