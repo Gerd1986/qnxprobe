@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.42"
+QNXPROBE_VERSION = "1.43"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -726,11 +726,12 @@ def parse_mbr(fh):
     mbr = read_at(fh, 0, 512)
     if len(mbr) < 512 or mbr[510:512] != b"\x55\xaa":
         return None
-    # A FAT, exFAT or NTFS boot sector also ends in 0x55AA, and its boot code
-    # sits where MBR partition entries would be, so it parses as four nonsense
-    # partitions. Its own type string at bytes 3..11 (exFAT, NTFS) or 82..90
-    # (FAT32) says it is a filesystem, not a partition table.
-    if (mbr[3:11] in (b"EXFAT   ", b"NTFS    ")
+    # A FAT, exFAT, NTFS or BitLocker boot sector also ends in 0x55AA, and its
+    # boot code sits where MBR partition entries would be, so it parses as four
+    # nonsense partitions. Its own type string at bytes 3..11 (exFAT, NTFS,
+    # BitLocker's "-FVE-FS-") or 82..90 (FAT32) says it is a volume, not a
+    # partition table.
+    if (mbr[3:11] in (b"EXFAT   ", b"NTFS    ", BDE_SIGNATURE)
             or mbr[82:90] == b"FAT32   " or mbr[54:62] == b"FAT16   "):
         return None
     # A QNX4 boot block can also end in 0x55AA (the dinit boot sector does).
@@ -9674,6 +9675,8 @@ def identify_fat(fh, base):
     wrote the volume.
     """
     b = read_at(fh, base, 512)
+    if b[3:11] == BDE_SIGNATURE or (b[3:11] == BDE_TOGO_SIGNATURE and b[424:440] == BDE_GUID):
+        return None                  # a BitLocker header: identify_bitlocker's, not a FAT volume
     if len(b) < 512 or b[510:512] != b"\x55\xaa":
         if b[3:11] != b"EXFAT   ":
             return None
@@ -9760,6 +9763,526 @@ def identify_f2fs(fh, base):
     return "f2fs", lines
 
 
+# ---------------------------------------------------------------- BitLocker
+#
+# Layout from Joachim Metz, "BitLocker Drive Encryption (BDE) format
+# specification", in libyal/libbde at 96e3c5dce6143c2702c90f3903018fb8c12a8956
+# (documentation/BitLocker Drive Encryption (BDE) format.asciidoc). How a sector
+# is read back follows libbde/libbde_sector_data.c at the same commit (lines
+# 274-420): the three metadata blocks and the area the first sectors were moved
+# to read as zeros; the first sectors are read from where BitLocker moved them and
+# decrypted with that location's sector number; and a sector past the encrypted
+# size, or in a range an unfinished conversion has not reached, is read as
+# stored. The Encrypt-on-Write map that records that range is read as
+# libbde/libbde_volume.c at the same commit reads it
+# (libbde_internal_volume_open_read_encrypt_on_write_data, line 1668).
+#
+# Measured on volumes Windows 11 Pro (build 26200) wrote: NTFS, FAT32 and exFAT;
+# AES-CBC and AES-XTS at 128 and 256 bits; opened with a password, a recovery
+# password, a startup key (.BEK) file, and the clear key a suspended volume keeps;
+# and three volumes whose conversion was paused (while encrypting, while encrypting
+# used space only, and while decrypting), each of which carries an Encrypt-on-Write
+# map. Not read: the Elephant diffuser (Windows Vista and 7 only), the Windows
+# Vista layout, and a TPM protector, whose key never leaves the device.
+
+try:
+    from Crypto.Cipher import AES as _BDE_AES                  # pycryptodome
+except ImportError:
+    try:
+        from Cryptodome.Cipher import AES as _BDE_AES          # pycryptodomex
+    except ImportError:
+        _BDE_AES = None
+
+BDE_SIGNATURE = b"-FVE-FS-"
+BDE_TOGO_SIGNATURE = b"MSWIN4.1"
+# 4967d63b-2e29-4ad8-8399-f6a339e3d001, and the identifier a volume carries while
+# an Encrypt-on-Write conversion is unfinished, 92a84d3b-dd80-4d0e-9e4e-b1e3284eaed8,
+# both as stored (the first three fields little-endian).
+BDE_GUID = bytes.fromhex("3bd66749292ed84a8399f6a339e3d001")
+BDE_EOW_GUID = bytes.fromhex("3b4da89280dd0e4d9e4eb1e3284eaed8")
+BDE_METADATA_SIZE = 65536
+BDE_STRETCH_ROUNDS = 0x100000
+BDE_CHUNK = 65536                    # decrypted and cached in 64 KiB pieces
+BDE_CACHE_CHUNKS = 256               # 16 MiB of plaintext kept per volume
+BDE_METHODS = {0x8000: "AES-128-CBC with the Elephant diffuser",
+               0x8001: "AES-256-CBC with the Elephant diffuser",
+               0x8002: "AES-128-CBC", 0x8003: "AES-256-CBC",
+               0x8004: "AES-128-XTS", 0x8005: "AES-256-XTS"}
+BDE_READ_METHODS = (0x8002, 0x8003, 0x8004, 0x8005)
+BDE_PROTECTORS = {0x0000: "clear key", 0x0100: "TPM", 0x0200: "startup key",
+                  0x0500: "TPM and PIN", 0x0800: "recovery password",
+                  0x2000: "password"}
+
+
+def _bde_entries(data):
+    """The FVE metadata entries in data: (entry type, value type, value bytes)."""
+    out, i = [], 0
+    while i + 8 <= len(data):
+        size, etype, vtype, _version = struct.unpack_from("<HHHH", data, i)
+        if size < 8 or i + size > len(data):
+            break
+        out.append((etype, vtype, bytes(data[i + 8:i + size])))
+        i += size
+    return out
+
+
+def _bde_guid(raw):
+    return str(uuid.UUID(bytes_le=bytes(raw))).upper()
+
+
+def _bde_ccm_open(key, value):
+    """The key data an AES-CCM encrypted key (value type 5) holds, or None when this
+    key does not open it: 12 bytes of nonce, a 16-byte tag, then the data, whose
+    first 12 bytes are its size, a version and the method."""
+    if _BDE_AES is None or len(value) < 40:
+        return None
+    try:
+        plain = _BDE_AES.new(key, _BDE_AES.MODE_CCM, nonce=value[:12],
+                             mac_len=16).decrypt_and_verify(value[28:], value[12:28])
+    except ValueError:
+        return None
+    size = struct.unpack_from("<I", plain, 0)[0]
+    return plain[12:size] if 12 < size <= len(plain) else None
+
+
+def bde_recovery_key(text):
+    """The 128-bit key a recovery password stands for, or None when text is not
+    one: 48 digits in eight groups (dashes and spaces are ignored), each group a
+    multiple of 11 whose quotient fits 16 bits."""
+    digits = "".join(ch for ch in text if ch not in "- ")
+    if len(digits) != 48 or not digits.isdigit():
+        return None
+    groups = [int(digits[i:i + 6]) for i in range(0, 48, 6)]
+    if any(g % 11 or g // 11 > 0xFFFF for g in groups):
+        return None
+    return b"".join(struct.pack("<H", g // 11) for g in groups)
+
+
+def _bde_stretch(initial, salt):
+    """BitLocker's key stretch: SHA-256 over (last, initial, salt, count), 2**20 times."""
+    import hashlib                              # pylint: disable=import-outside-toplevel
+    sha, pack, last, tail = hashlib.sha256, struct.Struct("<Q").pack, bytes(32), initial + salt
+    for count in range(BDE_STRETCH_ROUNDS):
+        last = sha(last + tail + pack(count)).digest()
+    return last
+
+
+def _bde_text(secret):
+    if isinstance(secret, (bytes, bytearray)):
+        try:
+            return bytes(secret).decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    return secret
+
+
+class BitLocker:
+    """A BitLocker volume at base in fh, read before any key is given: its method,
+    protectors and description, and, once unlock() finds a key, its plaintext.
+    BitLocker.open() returns None for anything that is not BitLocker."""
+
+    @classmethod
+    def open(cls, fh, base, size=None):
+        head = read_at(fh, base, 512)
+        if len(head) < 512 or not (
+                (head[3:11] == BDE_SIGNATURE
+                 and (head[160:176] in (BDE_GUID, BDE_EOW_GUID) or head[:3] == b"\xeb\x52\x90"))
+                or (head[3:11] == BDE_TOGO_SIGNATURE and head[424:440] == BDE_GUID)):
+            return None
+        if size is None:
+            size = image_size(fh) - base
+        return cls(fh, base, size, head)
+
+    def __init__(self, fh, base, size, head):
+        self.fh, self.base, self.size = fh, base, size
+        self.fvek, self.unlocked_by, self.tried, self.why = None, None, [], ""
+        self._k1 = self._k2 = None
+        self.label = "BitLocker volume"   # replaced by unlock_bitlocker with where it sits
+        self.method, self.description, self.created, self.volume_id = 0, "", 0, ""
+        self.protectors, self.vmks, self.eow_meta, self.eow_plain = [], [], [], []
+        self._fvek_value, self._cache = None, collections.OrderedDict()
+        if head[:3] == b"\xeb\x52\x90" and head[3:11] == BDE_SIGNATURE:
+            self.layout, offsets = "Windows Vista", ()
+        elif head[3:11] == BDE_TOGO_SIGNATURE:
+            self.layout, offsets = "To Go", struct.unpack_from("<QQQ", head, 440)
+        elif head[160:176] == BDE_EOW_GUID:
+            self.layout, offsets = "conversion unfinished", struct.unpack_from("<QQQ", head, 176)
+        else:
+            self.layout, offsets = "Windows 7 and later", struct.unpack_from("<QQQ", head, 176)
+        self.meta_offsets = offsets
+        self.bps = struct.unpack_from("<H", head, 11)[0]
+        self.enc_size = self.vh_offset = self.vh_size = self.vh_sectors = 0
+        entries = None
+        for off in offsets:
+            blk = read_at(fh, base + off, BDE_METADATA_SIZE)
+            if len(blk) < 112 or blk[:8] != BDE_SIGNATURE or struct.unpack_from("<H", blk, 10)[0] != 2:
+                continue
+            self.enc_size, self.vh_sectors = struct.unpack_from("<Q", blk, 16)[0], struct.unpack_from("<I", blk, 28)[0]
+            self.vh_offset = struct.unpack_from("<Q", blk, 56)[0]
+            msize, _mver, mhsize = struct.unpack_from("<III", blk, 64)
+            self.volume_id = _bde_guid(blk[80:96])
+            self.method = struct.unpack_from("<I", blk, 100)[0] & 0xFFFF
+            self.created = struct.unpack_from("<Q", blk, 104)[0]
+            entries = _bde_entries(blk[64 + mhsize:64 + msize])
+            break
+        if entries is None:
+            self.why = ("its metadata is in the Windows Vista layout, which this does not read"
+                        if self.layout == "Windows Vista" else "none of its three metadata blocks could be read")
+            return
+        for etype, vtype, val in entries:
+            if etype == 7 and vtype == 2:
+                self.description = val.decode("utf-16-le", "replace").rstrip("\x00")
+            elif etype == 2 and vtype == 8 and len(val) >= 28:
+                vmk = dict(id=_bde_guid(val[:16]), protection=struct.unpack_from("<H", val, 26)[0],
+                           props=_bde_entries(val[28:]))
+                self.vmks.append(vmk)
+                self.protectors.append((BDE_PROTECTORS.get(vmk["protection"],
+                                                           f"protection 0x{vmk['protection']:04x}"),
+                                        vmk["id"]))
+            elif etype == 3 and vtype == 5:
+                self._fvek_value = val
+            elif etype == 15 and vtype == 15 and len(val) >= 16:
+                self.vh_offset, self.vh_size = struct.unpack_from("<QQ", val, 0)
+        if not self.bps:
+            # The header of a BitLocker exFAT volume leaves bytes per sector 0;
+            # libbde_volume.c (lines 1497-1506) takes it from the moved header and
+            # accepts only 512 or 4096.
+            self.bps = (self.vh_size // self.vh_sectors
+                        if self.vh_size and self.vh_sectors else 512)
+        if self.bps not in (512, 4096) and not self.why:
+            self.why = f"its sector size, {self.bps} bytes, is not one BitLocker uses"
+            self.bps = 512
+        if not self.vh_size:
+            self.vh_size = self.vh_sectors * self.bps
+        if self.layout == "conversion unfinished":
+            try:
+                self._read_eow(head)
+            except (ValueError, struct.error) as exc:
+                self.why = f"its Encrypt-on-Write map could not be read ({exc})"
+        # Known from the metadata alone, so said whether or not a key is ever tried.
+        if not self.why and self.method not in BDE_READ_METHODS:
+            self.why = (f"it uses {BDE_METHODS.get(self.method, f'method 0x{self.method:04x}')}, "
+                        f"which this does not read")
+        elif not self.why and _BDE_AES is None:
+            self.why = ("reading it needs the optional pycryptodome package, which this "
+                        "Python does not have")
+
+    def _read_eow(self, head):
+        """The ranges an unfinished conversion has not reached, and the map's own
+        areas, which read as zeros like the rest of BitLocker's metadata."""
+        first, second = struct.unpack_from("<QQ", head, 200)
+        desc = read_at(self.fh, self.base + first, 4096)
+        if desc[:8] != b"FVE-EOW\x00":
+            raise ValueError("no FVE-EOW descriptor")
+        block, log_size = struct.unpack_from("<II", desc, 20)
+        count = struct.unpack_from("<I", desc, 32)[0]
+        if not block or count > 512:
+            raise ValueError("an implausible descriptor")
+        self.eow_meta = [(first, 4096)] + ([(second, 4096)] if second else [])
+        for off in struct.unpack_from(f"<{count}Q", desc, 56):
+            bm = read_at(self.fh, self.base + off, 4096)
+            if bm[:10] != b"FVE-EOWBM\x00":
+                raise ValueError(f"no block map at byte {off:,}")
+            bm_size, _index, region, region_size, log_off, r1, r2, rsize = \
+                struct.unpack_from("<IIQQQIII", bm, 12)
+            self.eow_meta.append((off, -(-bm_size // 4096) * 4096))
+            if log_off:
+                self.eow_meta.append((log_off, -(-log_size // 4096) * 4096))
+            best = None
+            for roff in (r1, r2):
+                rec = read_at(self.fh, self.base + off + roff, rsize)
+                if rec[:10] == b"FVE-EOWBR\x00":
+                    bits, seq = struct.unpack_from("<IQ", rec, 16)
+                    if best is None or seq > best[0]:
+                        best = (seq, bits, rec[36:])
+            if best is None:
+                raise ValueError(f"no block record in the map at byte {off:,}")
+            _seq, bits, bitmap = best
+            # A set bit is a block already encrypted; the newest record decides.
+            for i in range(min(bits, len(bitmap) * 8)):
+                start = i * block
+                if start >= region_size:
+                    break
+                if not bitmap[i // 8] >> (i % 8) & 1:
+                    end = region + min(start + block, region_size)
+                    if self.eow_plain and self.eow_plain[-1][1] == region + start:
+                        self.eow_plain[-1] = (self.eow_plain[-1][0], end)
+                    else:
+                        self.eow_plain.append((region + start, end))
+
+    def lines(self):
+        """What the volume says about itself before any key is given."""
+        out = [f"encryption   {BDE_METHODS.get(self.method, f'method 0x{self.method:04x}') if self.method else 'not read'}"
+               + (f", {self.layout} layout" if self.layout != "Windows 7 and later" else "")]
+        if self.eow_plain:
+            out.append(f"conversion   unfinished: {human(sum(e - s for s, e in self.eow_plain))} "
+                       f"not yet encrypted (the rest reads through its key)")
+        if self.description:
+            out.append(f"description  {self.description}")
+        if self.created:
+            out.append(f"created      {stamp(int(ntfs_time(self.created)))}")
+        if self.volume_id:
+            out.append(f"volume id    {self.volume_id}")
+        for kind, pid in self.protectors:
+            out.append(f"protector    {kind:<18} id {pid}")
+        if any(kind == "clear key" for kind, _pid in self.protectors):
+            # Windows lists no clear key among a volume's protectors; it is what
+            # suspending protection leaves (manage-bde -protectors -disable).
+            out.append("suspended    protection is off: the volume keeps its key in the clear, "
+                       "so it opens with no key given")
+        return out
+
+    def unlock(self, passwords=(), key_files=()):
+        """True once a key opens the volume: its clear key, a startup key file, or a
+        password or recovery password among passwords. Records what was tried."""
+        if self.fvek is not None:
+            return True
+        if self.why:
+            return False
+        texts = [t for t in (_bde_text(p) for p in passwords) if t]
+        keyfiles = []
+        for kf in key_files:
+            try:
+                keyfiles.append(kf if isinstance(kf, (bytes, bytearray)) else open(kf, "rb").read())
+            except OSError:
+                continue
+        order = sorted(self.vmks, key=lambda v: {0x0000: 0, 0x0200: 1}.get(v["protection"], 2))
+        for vmk in order:
+            prot, key = vmk["protection"], None
+            ccm = next((val for _e, vt, val in vmk["props"] if vt == 5), None)
+            if ccm is None:
+                continue
+            if prot == 0x0000:
+                clear = next((val for _e, vt, val in vmk["props"] if vt == 1), None)
+                key = _bde_ccm_open(clear[4:36], ccm) if clear else None
+            elif prot == 0x0200:
+                for raw in keyfiles:
+                    for _e, vt, val in _bde_entries(raw[48:]):
+                        if vt == 9 and len(val) >= 24 and _bde_guid(val[:16]) == vmk["id"]:
+                            kd = next((v for _e2, t2, v in _bde_entries(val[24:]) if t2 == 1), None)
+                            key = _bde_ccm_open(kd[4:36], ccm) if kd else None
+                    if key:
+                        break
+            elif prot in (0x0800, 0x2000):
+                stretch = next((val for _e, vt, val in vmk["props"] if vt == 3), None)
+                if stretch is None or not texts:
+                    continue
+                import hashlib                  # pylint: disable=import-outside-toplevel
+                for text in texts:
+                    if prot == 0x0800:
+                        rk = bde_recovery_key(text)
+                        if rk is None:
+                            continue
+                        initial = hashlib.sha256(rk).digest()
+                    else:
+                        initial = hashlib.sha256(hashlib.sha256(text.encode("utf-16-le")).digest()).digest()
+                    key = _bde_ccm_open(_bde_stretch(initial, stretch[4:20]), ccm)
+                    if key:
+                        break
+            else:
+                continue
+            # Recorded only when something given was tried against it, so a locked
+            # volume's note never claims keys were given when none were.
+            if prot == 0x0200 and keyfiles or prot in (0x0800, 0x2000) and texts:
+                self.tried.append(BDE_PROTECTORS.get(prot, hex(prot)))
+            if key and len(key) >= 32:
+                fvek = _bde_ccm_open(key[:32], self._fvek_value or b"")
+                if fvek:
+                    half = 16 if self.method in (0x8002, 0x8004) else 32
+                    self._k1 = _BDE_AES.new(fvek[:half], _BDE_AES.MODE_ECB)
+                    self._k2 = (_BDE_AES.new(fvek[half:2 * half], _BDE_AES.MODE_ECB)
+                                if self.method in (0x8004, 0x8005) else None)
+                    self.fvek, self.unlocked_by = fvek, BDE_PROTECTORS.get(prot)
+                    return True
+        return False
+
+    def _decrypt(self, phys, data):
+        """Whole sectors read at volume offset phys, decrypted with the key and the
+        sector position libbde_sector_data.c uses: the byte offset for AES-CBC, the
+        sector number for AES-XTS."""
+        bps, n = self.bps, len(data) // self.bps
+        if self._k2 is not None:
+            # XTS tweaks for every sector at once: lane i of v (128 bits each) holds
+            # sector i's tweak for block j, doubled in GF(2**128) for each next block
+            # (the carry out of a lane folds back in as 0x87), and each block's
+            # tweaks are laid into place with strided copies.
+            first, per, width = phys // bps, bps // 16, 16 * n
+            v = int.from_bytes(self._k2.encrypt(
+                b"".join((first + i).to_bytes(16, "little") for i in range(n))), "little")
+            low = int.from_bytes((b"\x01" + bytes(15)) * n, "little")
+            keep = ((1 << (128 * n)) - 1) ^ low
+            tw = bytearray(len(data))
+            for j in range(per):
+                vb = v.to_bytes(width, "little")
+                for k in range(16):
+                    tw[16 * j + k::bps] = vb[k::16]
+                carry = (v >> 127) & low
+                v = ((v << 1) & keep) ^ carry ^ (carry << 1) ^ (carry << 2) ^ (carry << 7)
+            tweak = int.from_bytes(tw, "little")
+            x = (int.from_bytes(data, "little") ^ tweak).to_bytes(len(data), "little")
+            return (int.from_bytes(self._k1.decrypt(x), "little") ^ tweak).to_bytes(len(data), "little")
+        ivs = self._k1.encrypt(b"".join((phys + i * bps).to_bytes(16, "little") for i in range(n)))
+        prev = b"".join(ivs[16 * i:16 * i + 16] + data[i * bps:(i + 1) * bps - 16] for i in range(n))
+        return (int.from_bytes(self._k1.decrypt(data), "little")
+                ^ int.from_bytes(prev, "little")).to_bytes(len(data), "little")
+
+    def _sector_source(self, pos):
+        """("zero", 0), ("raw", phys) or ("dec", phys) for the sector at pos."""
+        if (any(mo <= pos < mo + BDE_METADATA_SIZE for mo in self.meta_offsets)
+                or self.vh_offset <= pos < self.vh_offset + self.vh_size
+                or any(s <= pos < s + n for s, n in self.eow_meta)):
+            return "zero", 0
+        phys = pos + self.vh_offset if pos < self.vh_size else pos
+        if (self.enc_size and phys >= self.enc_size) or any(s <= phys < e for s, e in self.eow_plain):
+            return "raw", phys
+        return "dec", phys
+
+    def _plain(self, start, length):
+        bps, out, pos, end = self.bps, bytearray(), start, start + length
+        while pos < end:
+            kind, phys = self._sector_source(pos)
+            run = bps
+            while pos + run < end:
+                k2, p2 = self._sector_source(pos + run)
+                if k2 != kind or (kind != "zero" and p2 != phys + run):
+                    break
+                run += bps
+            if kind == "zero":
+                out += bytes(run)
+            else:
+                data = read_at(self.fh, self.base + phys, run)
+                whole = len(data) - len(data) % bps
+                out += (self._decrypt(phys, data[:whole]) + data[whole:]) if kind == "dec" else data
+                if len(data) < run:
+                    break
+            pos += run
+        return bytes(out)
+
+    def read(self, off, n):
+        """n plaintext bytes at volume offset off (short at the end of the volume)."""
+        out, pos, end = bytearray(), off, min(off + n, self.size)
+        while pos < end:
+            ci = pos // BDE_CHUNK
+            chunk = self._cache.get(ci)
+            if chunk is None:
+                start = ci * BDE_CHUNK
+                chunk = self._plain(start, min(BDE_CHUNK, self.size - start))
+                self._cache[ci] = chunk
+                if len(self._cache) > BDE_CACHE_CHUNKS:
+                    self._cache.popitem(last=False)
+            else:
+                self._cache.move_to_end(ci)
+            s = pos - ci * BDE_CHUNK
+            take = min(len(chunk) - s, end - pos)
+            if take <= 0:
+                break
+            out += chunk[s:s + take]
+            pos += take
+        return bytes(out)
+
+    def summary(self):
+        return (f"BitLocker {BDE_METHODS.get(self.method, '')}, unlocked with its {self.unlocked_by}"
+                if self.fvek is not None else "BitLocker, locked")
+
+    def locked_note(self):
+        """Why the volume was not read, and what would open it."""
+        if self.why:
+            return f"BitLocker-encrypted and not read: {self.why}"
+        kinds = [k for k, _i in self.protectors]
+        if kinds and all(k.startswith("TPM") for k in kinds):
+            return ("BitLocker-encrypted and not read: its only protector is the device's "
+                    "TPM, whose key does not leave the device")
+        usable = []
+        for kind, pid in self.protectors:
+            if kind == "recovery password":
+                usable.append(f"recovery password (protector id {pid})")
+            elif kind in ("password", "startup key") and kind not in usable:
+                usable.append(kind)
+        tried = "none of the passwords or key files given opens it; " if self.tried else ""
+        return (f"BitLocker-encrypted and not read: {tried}it opens with its "
+                + " or its ".join(usable or ["key"]))
+
+
+def identify_bitlocker(fh, base, size=None):
+    """Return ("bitlocker", lines) for a BitLocker volume at base, else None."""
+    bl = BitLocker.open(fh, base, size)
+    return ("bitlocker", bl.lines()) if bl else None
+
+
+class BitLockerImage:
+    """An image read through read_at() with its unlocked BitLocker volumes
+    decrypted in place, so identify_fs() and every walker read the plaintext at
+    the volume's own offset. ``bitlocker`` maps each such volume's byte offset to
+    its BitLocker object; anything else is the image's own attribute."""
+
+    def __init__(self, fh, opened, found=()):
+        self._fh, self.bitlocker, self.bitlocker_found = fh, dict(opened), list(found)
+        self.size = image_size(fh)
+        self._spans = sorted((b, b + v.size, v) for b, v in self.bitlocker.items())
+        self._pos = 0
+
+    def __getattr__(self, name):
+        return getattr(self._fh, name)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        self.close()
+
+    def close(self):
+        self._fh.close()
+
+    def seek(self, off, whence=0):
+        self._pos = off if whence == 0 else self._pos + off if whence == 1 else self.size + off
+        return self._pos
+
+    def tell(self):
+        return self._pos
+
+    def read(self, n=-1):
+        end = self.size if n is None or n < 0 else min(self.size, self._pos + n)
+        out = bytearray()
+        while self._pos < end:
+            span = next((s for s in self._spans if s[0] <= self._pos < s[1]), None)
+            if span is not None:
+                take = min(end, span[1]) - self._pos
+                got = span[2].read(self._pos - span[0], take)
+            else:
+                nxt = min([s[0] for s in self._spans if s[0] > self._pos] + [end])
+                self._fh.seek(self._pos)
+                got = self._fh.read(nxt - self._pos)
+            if not got:
+                break
+            out += got
+            self._pos += len(got)
+        return bytes(out)
+
+
+def unlock_bitlocker(fh, size=None, passwords=(), key_files=()):
+    """Find the BitLocker volumes in an opened image and open those the passwords
+    (tried as passwords and as recovery passwords) or startup key files open.
+    Returns (fh, found): fh is a BitLockerImage when there is any BitLocker volume
+    (``bitlocker`` holds those opened, ``bitlocker_found`` every one, so volumes()
+    can say why a locked one was not read), else the image unchanged; found holds
+    one BitLocker per volume, opened or not."""
+    if size is None:
+        size = image_size(fh)
+    regions, _names, containers, protective = partition_regions(fh, size)
+    found, opened = [], {}
+    for label, base, rsize in regions:
+        if label in containers or label in protective:
+            continue
+        bl = BitLocker.open(fh, base, rsize)
+        if bl is None:
+            continue
+        bl.label = label
+        if bl.unlock(passwords, key_files):
+            opened[base] = bl
+        found.append(bl)
+    return (BitLockerImage(fh, opened, found) if found else fh), found
+
+
 def identify_fs(fh, base, size=None):
     """Return (name, [detail lines]) for whatever sits at this partition.
 
@@ -9791,6 +10314,13 @@ def identify_fs(fh, base, size=None):
         found = ident(fh, base, size)
         if found:
             return found
+
+    # BitLocker before the rest: its header is a FAT32 boot sector in all but its
+    # signature and identifier (so identify_fat would take it for an empty FAT32
+    # volume), and the ciphertext behind it can carry ext's 2-byte magic by chance.
+    bde = identify_bitlocker(fh, base, size)
+    if bde:
+        return bde
 
     sb = read_at(fh, base + EXT_SB_OFF, 1024)
     if len(sb) == 1024 and _e(sb, "magic", 2) == EXT_MAGIC:
@@ -10174,6 +10704,19 @@ def volumes(fh, size=None):
         vol = dict(label=label, base=base, size=rsize, lba=base // ss,
                    kind=kind or "not recognised", name=stem,
                    detail="; ".join(lines[:2]), missing_past_end=missing.get(base, 0))
+        # A BitLocker volume unlock_bitlocker() opened reads as the filesystem inside
+        # it, and says so; one it did not open says why and what would open it.
+        opened = getattr(fh, "bitlocker", {}).get(base)
+        if opened is not None:
+            vol["encryption"] = opened.summary()
+            vol["detail"] = "; ".join([opened.summary()] + lines[:1])
+        if kind == "bitlocker":
+            bl = next((b for b in getattr(fh, "bitlocker_found", ()) if b.base == base), None)
+            bl = bl or BitLocker.open(fh, base, rsize)
+            vol["encryption"] = "BitLocker, locked"
+            vol["note"] = bl.locked_note() if bl else "BitLocker-encrypted and not read"
+            out.append(vol)
+            continue
         try:
             if kind and kind.startswith("ext"):
                 ext_name = _ext_label(fh, base)
@@ -10236,12 +10779,16 @@ def _cli_passwords(files, env_names):
 
 def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
          extract=None, only=None, zf=None, do_triage=False, exclude=None,
-         reporter=None, manifest=None, passwords=()):
+         reporter=None, manifest=None, passwords=(), key_files=()):
     # a set that is not whole raises SplitImageError; an acquisition's reader joins
     # its own files (an AD-encrypted raw set is numbered like a split image, and its
     # files are ciphertext until the reader decrypts them)
     segments = [] if acquisition_format(path) else split_segments(path)
     image = open_image_trying(path, segments, passwords)
+    # A BitLocker volume the passwords (as passwords or recovery passwords) or the
+    # startup key files open is read decrypted in place; the rest stay locked and
+    # the report says so.
+    image, bitlocker_found = unlock_bitlocker(image, None, passwords, key_files)
     size = image_size(image)
     print("=" * 78)
     print(path)
@@ -10604,8 +11151,21 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     continue
                 kind, lines = identify_fs(fh, b, sz)
                 print(f"    {lab}   {human(sz)}   ->  {kind or 'not recognised'}")
+                opened = getattr(fh, "bitlocker", {}).get(b)
+                if opened is not None:
+                    print(f"        {opened.summary()}; what follows is the decrypted volume")
+                    for line in opened.lines():
+                        print(f"          {line}")
                 for line in lines:
                     print(f"        {line}")
+                if kind == "bitlocker":
+                    bl = next((x for x in bitlocker_found if x.base == b), None)
+                    if bl is not None:
+                        print(f"        {bl.locked_note()}")
+                        if not bl.why and any(k in ("password", "recovery password", "startup key")
+                                              for k, _i in bl.protectors):
+                            print("        (give a password or recovery password with --password-file "
+                                  "or --password-env, a startup key with --bitlocker-key)")
                 ext_name = ""
                 if kind and kind.startswith("ext"):
                     _sb = read_at(fh, b + EXT_SB_OFF, 1024)
@@ -14905,6 +15465,108 @@ def self_test():
                   f"disagreement when the fast route drops an entry "
                   f"({broke_wrong} found)")
 
+        # BitLocker, on volumes tools/make_bitlocker_fixtures.py lays out around the
+        # SquashFS fixture from the format document, not from this reader (which was
+        # also checked against volumes Windows 11 wrote). The identifier and the test
+        # secrets are written out again here, not taken from the reader or the tool.
+        true_bde_guid = bytes.fromhex("3bd66749292ed84a8399f6a339e3d001")   # 4967d63b-2e29-...
+        cond = BDE_GUID == true_bde_guid and BDE_SIGNATURE == b"-FVE-FS-"
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] the BitLocker identifier and signature are the "
+              f"format's")
+        rk_dash = bde_recovery_key("111111-222222-333333-444444-555555-666666-000011-000022")
+        cond = (rk_dash is not None and rk_dash[:2] == b"\x75\x27"       # 111111 / 11 = 10101
+                and bde_recovery_key("111111 222222 333333 444444 555555 666666 000011 000022") == rk_dash
+                and bde_recovery_key("111112-222222-333333-444444-555555-666666-000011-000022") is None)
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a recovery password is read with or without its "
+              f"dashes, and one whose group is not a multiple of 11 is not one")
+        bde_first = os.path.join(here, "bitlocker-xts128.img.gz")
+        if _BDE_AES is None or not os.path.isfile(bde_first):
+            print("  [SKIP] BitLocker volumes open with their keys (needs the BitLocker "
+                  "fixtures and the pycryptodome package)")
+        else:
+            import gzip as _gz, hashlib as _hl, io as _bio  # pylint: disable=import-outside-toplevel
+            bde_pw = "qnxprobe-bde-test"
+            bde_rec_a = "111111-222222-333333-444444-555555-666666-000011-000022"
+            bde_rec_b = "000011-000022-000033-000044-000055-000066-000077-000088"
+            with open(os.path.join(here, "bitlocker-xts128.BEK"), "rb") as handle:
+                bde_bek = handle.read()
+            with open(os.path.join(here, "squashfs.src.sha256"), encoding="utf-8") as handle:
+                bde_sums = dict(reversed(line.rstrip("\n").split("  ", 1))
+                                for line in handle if line.strip())
+
+            def _bde(name, secrets=(), keys=()):
+                with _gz.open(os.path.join(here, f"bitlocker-{name}.img.gz"), "rb") as g:
+                    raw = g.read()
+                fh, _found = unlock_bitlocker(_bio.BytesIO(raw), len(raw), secrets, keys)
+                vol = volumes(fh, len(raw))[0]
+                matched, walker = 0, vol.get("walker")
+                if walker is not None:
+                    got = {p: (n, sz) for p, n, _m, sz, _t, _r in walk_all(walker)}
+                    for path, digest in bde_sums.items():
+                        g = got.get(path)
+                        if g and _hl.sha256(b"".join(walker.read_file(*g))).hexdigest() == digest:
+                            matched += 1
+                return vol, matched, raw
+
+            def _opened(by):
+                return lambda v, m: (v["kind"] == "squashfs" and m == len(bde_sums)
+                                     and v.get("encryption", "").endswith(f"unlocked with its {by}"))
+
+            bde_legs = [
+                ("a locked volume is named, not walked, and says what opens it, with the "
+                 "recovery password's protector id", "xts128", (), (),
+                 lambda v, m: (v["kind"] == "bitlocker" and v.get("walker") is None
+                               and "recovery password (protector id" in v.get("note", "")
+                               and "startup key" in v.get("note", "")
+                               and "none of the passwords" not in v.get("note", ""))),
+                ("a wrong password leaves it locked, saying the keys given did not open it",
+                 "xts128", ("not-the-password",), (),
+                 lambda v, m: v["kind"] == "bitlocker" and "none of the passwords" in v.get("note", "")),
+                ("its password opens AES-128-XTS", "xts128", (bde_pw,), (), _opened("password")),
+                ("its recovery password opens it", "xts128", (bde_rec_a,), (),
+                 _opened("recovery password")),
+                ("its startup key (.BEK) opens it", "xts128", (), (bde_bek,), _opened("startup key")),
+                ("a recovery password opens AES-256-CBC", "cbc256", (bde_rec_b,), (),
+                 _opened("recovery password")),
+                ("a suspended volume opens with the clear key it keeps (AES-256-XTS)", "clearkey",
+                 (), (), _opened("clear key")),
+                ("an unfinished conversion reads its unencrypted range as stored "
+                 "(Encrypt-on-Write map)", "eow", (bde_pw,), (), _opened("password")),
+                ("the To Go layout opens (constructed only; Windows 11 wrote none)", "togo",
+                 (bde_pw,), (), _opened("password")),
+                ("a volume protected only by a TPM says its key does not leave the device",
+                 "tpm", (), (), lambda v, m: v["kind"] == "bitlocker" and "TPM" in v.get("note", "")),
+                ("the Elephant diffuser is named as not read", "diffuser", (bde_pw,), (),
+                 lambda v, m: "Elephant diffuser" in v.get("note", "")),
+                ("the Windows Vista layout is named as not read", "vista", (bde_pw,), (),
+                 lambda v, m: "Windows Vista" in v.get("note", "")),
+            ]
+            bde_raw = {}
+            for label, name, secrets, keys, test in bde_legs:
+                try:
+                    vol, matched, raw = _bde(name, secrets, keys)
+                    cond = bool(test(vol, matched))
+                    detail = f"{vol['kind']}, {matched}/{len(bde_sums)} files"
+                    bde_raw[name] = raw
+                except Exception as exc:                 # pylint: disable=broad-except
+                    cond, detail = False, f"raised {type(exc).__name__}: {exc}"
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] BitLocker: {label} ({detail})")
+            if "xts128" in bde_raw and "vista" in bde_raw:
+                win7, vista = _bio.BytesIO(bde_raw["xts128"]), _bio.BytesIO(bde_raw["vista"])
+                cond = (identify_fat(win7, 0) is None and parse_mbr(win7) is None
+                        and parse_mbr(vista) is None)
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] a BitLocker header (a FAT32 boot sector in "
+                      f"all but its own fields, or Windows Vista's NTFS-like one) is taken for "
+                      f"neither a FAT32 volume nor a partition table")
+
         print()
         print("  SELF-TEST PASSED. The detector reports positives and negatives"
               if ok else
@@ -15221,6 +15883,17 @@ what it checks, and where the constants come from:
   carries its spare bytes, the common page and spare sizes are tried and the
   spare is stripped.
 
+  For BitLocker, from Joachim Metz's BDE format document in libyal/libbde at
+  commit 96e3c5dce6143c2702c90f3903018fb8c12a8956:
+  volume header, FVE metadata     documentation/...BDE) format.asciidoc
+  recovery password, user key     sections "Recovery key", "User key"
+  AES-CBC IV, AES-XTS tweak       sections "AES-CBC", "AES-XTS"
+  sector read-back rules          libbde/libbde_sector_data.c:274-420
+  Encrypt-on-Write map            libbde/libbde_volume.c:1668
+  Checked against 13 volumes Windows 11 wrote (NTFS, FAT32, exFAT; AES-CBC
+  and AES-XTS at 128 and 256 bits; password, recovery password, startup key,
+  clear key; conversions paused while encrypting and decrypting).
+
   --list walks qnx6 through the same block resolution the kernel uses in
   qnx6_block_map(), including multi-level indirect trees and long filenames
   held out of line in the Longfile tree, and walks ext through its extent
@@ -15283,14 +15956,18 @@ if __name__ == "__main__":
                          "the human readable report, is unchanged")
     ap.add_argument("--password-file", metavar="FILE", action="append", default=[],
                     help="for an encrypted image (an Apple disk image or an AD-encrypted "
-                         "FTK Imager acquisition): a password, the first line "
-                         "of FILE. Repeatable; each image opens with the first "
-                         "password that opens it")
+                         "FTK Imager acquisition) or a BitLocker volume: a password or "
+                         "recovery password, the first line of FILE. Repeatable; each "
+                         "opens with the first one that opens it")
     ap.add_argument("--password-env", metavar="NAME", action="append", default=[],
-                    help="for an encrypted image: a password, from the "
-                         "environment variable NAME. Repeatable. Without either, "
-                         "qnxprobe asks at a terminal. A password is never taken as an "
-                         "argument, which would show in the process list")
+                    help="for an encrypted image or a BitLocker volume: a password, "
+                         "from the environment variable NAME. Repeatable. Without either, "
+                         "qnxprobe asks at a terminal for an encrypted image's password. "
+                         "A password is never taken as an argument, which would show in "
+                         "the process list")
+    ap.add_argument("--bitlocker-key", metavar="FILE", action="append", default=[],
+                    help="a BitLocker startup key (a .BEK file), tried against every "
+                         "BitLocker volume. Repeatable")
     ap.add_argument("--version", action="version",
                     version=f"qnxprobe {QNXPROBE_VERSION}")
     args = ap.parse_args()
@@ -15329,7 +16006,8 @@ if __name__ == "__main__":
                              extract=args.extract, only=args.only, zf=zf,
                              do_triage=args.triage, exclude=args.exclude,
                              reporter=reporter, manifest=manifest,
-                             passwords=given_passwords or asked)
+                             passwords=given_passwords or asked,
+                             key_files=args.bitlocker_key)
                         break
                     except ImagePasswordError as exc:
                         # asked for at a terminal only when none was given, three

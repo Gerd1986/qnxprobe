@@ -47,6 +47,10 @@ decompresses to exactly the size its header records and the image checksum
 balances). See [What it does not do](#what-it-does-not-do) for the compression
 methods it recognises but does not yet read.
 
+It also opens BitLocker volumes with their password, recovery password or startup key
+(`.BEK`) file, and reads the NTFS, FAT32 or exFAT inside them; without a key it names
+the volume, its protectors and what would open it. See [BitLocker](#bitlocker).
+
 It also reads the filesystems embedded Linux keeps on flash: SquashFS, JFFS2, UBI and the
 UBIFS inside it, and YAFFS1 and YAFFS2. They are what routers, cameras, drones and Linux
 head units tend to carry, often as a chip dump with no partition table and sometimes with
@@ -606,6 +610,80 @@ refused by this reader and is the one case `icat` will read on the contiguous
 assumption; refusing it is the deliberate choice not to present bytes the entry cannot
 vouch for.
 
+## BitLocker
+
+Since 1.43 a BitLocker volume is recognised by its own header and, given a key, read
+decrypted in place, so the filesystem inside it (NTFS, FAT32 or exFAT) is listed and
+extracted like any other. Before 1.43 its header, which is a FAT32 boot sector in all but
+BitLocker's own signature and identifier, was taken for an empty FAT32 volume.
+
+Without a key the volume is listed as `bitlocker` and not walked. The report gives what
+the volume records about itself: the encryption method, its description (the computer
+name, drive label and date Windows wrote when it was encrypted, as stored), when it was
+created, its volume id, and each key protector with its id. The note says what would
+open it, naming the recovery password's protector id, which is the id to quote when
+asking for the recovery key from wherever it was escrowed.
+
+A key is one of:
+
+- its password or recovery password, with `--password-file FILE` or `--password-env NAME`,
+  the options an encrypted image takes (each one given is tried as both);
+- its startup key, a `.BEK` file, with `--bitlocker-key FILE`;
+- nothing, when protection is suspended: the volume then keeps its key in the clear, and
+  the report says `suspended`.
+
+A volume whose only protector is its TPM cannot be read from an image, because the TPM's
+key never leaves the device; a recovery password set on the same volume still opens it.
+The window asks for a password or recovery password for each locked volume when it
+loads an image, and takes a `.BEK` file when the answer is left empty.
+
+From Python:
+
+```python
+image = q.open_image(path)
+image, found = q.unlock_bitlocker(image, passwords=[recovery_password], key_files=["key.BEK"])
+for vol in q.volumes(image):
+    print(vol["kind"], vol.get("encryption", ""), vol.get("note", ""))
+```
+
+`unlock_bitlocker()` returns the image with every volume it opened decrypted in place,
+so `read_at()` at that volume's own offsets returns plaintext and every walker, free
+space report and extraction sees the decrypted volume; it also returns one `BitLocker`
+per volume found, opened or not, whose `lines()` is what the report prints. A volume it
+opened carries `encryption` in `volumes()` (`BitLocker AES-128-XTS, unlocked with its
+recovery password`), and a locked one carries `BitLocker, locked` and the note.
+
+**What is read**: AES-128 and AES-256 in CBC and XTS modes, the layout Windows 7 and later
+write, and a volume whose conversion was paused while encrypting or decrypting. Such a
+volume carries an Encrypt-on-Write map saying which ranges are not yet encrypted, and
+those are read as stored. **What is not**: the Elephant diffuser (Windows Vista and 7), the
+Windows Vista layout, and a TPM; each is named in the note. The BitLocker To Go layout
+for FAT volumes (Windows 7's discovery volume on removable drives) is read the same way,
+but no sample of it exists here, so it is tested only on constructed volumes.
+
+A volume encrypted with "used space only" encrypted only the space holding data at the
+time, and its free space is not wiped
+([Microsoft, BitLocker configuration](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/configure)).
+Space that was free then and not written since can still hold earlier data in the clear,
+and reading it through the key turns that into noise. If deleted files from before
+encryption matter, carve the partition as stored as well as decrypted.
+
+Decryption is pure Python over the `pycryptodome` package the release executables carry:
+on an Apple M2 Max, about 80 MB/s for XTS and 120 MB/s for CBC.
+
+Checked against 13 volumes Windows 11 Pro (build 26200) wrote: NTFS with each of the four
+methods, FAT32 and exFAT, a suspended volume, two fully encrypted ones, and four whose
+conversion was paused (encrypting used space only at 93.8%, and three paused early:
+encrypting at 45.6%, encrypting used space only at 58.6%, decrypting with 63.8% still
+encrypted). On every one, every file written before encryption hashed as Windows
+recorded, each opened with each of its keys given alone (the suspended one with the
+clear key, which is tried first), and the protector ids equal those Windows reports
+(less the clear key of the suspended volume, which Windows does not list as a
+protector). With the Encrypt-on-Write map ignored, the three early ones lost 8 and 9 of
+their 25 files, and the one being decrypted was not recognised as NTFS at all. Those
+volumes are kept outside this repository; `tools/make_bitlocker_fixtures.py` builds the
+small ones the self-test reads.
+
 ## F2FS
 
 F2FS is the filesystem Android uses for `/data` on most phones, so an Android
@@ -1100,8 +1178,9 @@ reported as not recognised, with its first bytes shown.
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
-| `--password-file FILE` | For an encrypted image (an Apple disk image or an AD-encrypted FTK Imager acquisition): a password, the first line of FILE. Repeatable |
-| `--password-env NAME` | For an encrypted image: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal |
+| `--password-file FILE` | For an encrypted image (an Apple disk image or an AD-encrypted FTK Imager acquisition) or a BitLocker volume: a password or recovery password, the first line of FILE. Repeatable |
+| `--password-env NAME` | For an encrypted image or a BitLocker volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
+| `--bitlocker-key FILE` | A BitLocker startup key (a `.BEK` file), tried against every BitLocker volume. Repeatable |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
@@ -1358,6 +1437,21 @@ YAFFS1 tags and deletion                core/yaffs_tagscompat.c, core/yaffs_yaff
 root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 ```
 
+BitLocker, from Joachim Metz's
+[BitLocker Drive Encryption (BDE) format specification](https://github.com/libyal/libbde/blob/96e3c5dce6143c2702c90f3903018fb8c12a8956/documentation/BitLocker%20Drive%20Encryption%20(BDE)%20format.asciidoc)
+in libyal/libbde at commit `96e3c5dce6143c2702c90f3903018fb8c12a8956`, and for how a
+sector is read back, libbde's own code at the same commit:
+
+```
+volume header, FVE metadata blocks and entries   the format document
+recovery password and user key stretching        sections "Recovery key", "User key"
+AES-CBC IV, AES-XTS tweak                        sections "AES-CBC", "AES-XTS"
+moved first sectors, zeroed metadata, the
+encrypted size, unencrypted ranges               libbde/libbde_sector_data.c:274-420
+Encrypt-on-Write map                             libbde/libbde_volume.c:1668
+bytes per sector from the moved header           libbde/libbde_volume.c:1497-1506
+```
+
 `--help` prints this same sourcing, so it travels with the tool.
 
 ## What it does not do
@@ -1384,10 +1478,12 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
-- **It does not decrypt a filesystem.** An encrypted Apple disk image or an
-  AD-encrypted acquisition opens with its password (above), because the encryption is
-  the container's. A volume with encrypted
-  filenames is flagged, not opened.
+- **It decrypts BitLocker, not a filesystem's own encryption.** An encrypted Apple disk
+  image or an AD-encrypted acquisition opens with its password, and a BitLocker volume
+  with its key (above), because that encryption wraps the whole volume. An encrypted APFS
+  volume, an NTFS file encrypted on its own, and a volume with encrypted filenames are
+  flagged, not opened. A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
+  protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
 - **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
