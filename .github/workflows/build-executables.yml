@@ -152,6 +152,38 @@ jobs:
           print(f"{match} of {len(want)} files from the zstd SquashFS match their source hashes")
           assert match == len(want) == 612
 
+      - name: Check the command line executable opens a BitLocker volume
+        shell: python
+        run: |
+          # Proves the build carries the AES modes BitLocker needs (CCM for its keys,
+          # ECB for XTS), which the frozen self-test cannot show: its BitLocker
+          # fixtures are not beside the executable. The password is the fixture's
+          # test value, given by file as an examiner would give one.
+          import gzip, hashlib, os, shutil, subprocess, zipfile
+          ext = ".exe" if os.name == "nt" else ""
+          cli = os.path.join("dist", "qnxprobe" + ext)
+          with gzip.open("tests/fixtures/bitlocker-xts128.img.gz") as src, open("bde.img", "wb") as dst:
+              shutil.copyfileobj(src, dst)
+          with open("bde-password.txt", "w", encoding="utf-8") as fh:
+              fh.write("qnxprobe-bde-test\n")
+          want = {}
+          with open("tests/fixtures/squashfs.src.sha256", encoding="utf-8") as fh:
+              for line in fh:
+                  digest, path = line.rstrip("\n").split("  ", 1)
+                  want["lba0/" + path] = digest
+          for label, extra, out in (("password", ["--password-file", "bde-password.txt"], "bde-pw.zip"),
+                                    ("startup key", ["--bitlocker-key",
+                                                     "tests/fixtures/bitlocker-xts128.BEK"], "bde-key.zip")):
+              r = subprocess.run([cli] + extra + ["--extract", out, "bde.img"],
+                                 capture_output=True, text=True)
+              print(r.stdout[-500:]); assert r.returncode == 0, r.stderr[-2000:]
+              assert f"unlocked with its {label}" in r.stdout, f"not unlocked with its {label}"
+              with zipfile.ZipFile(out) as z:
+                  got = {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist() if n in want}
+              match = sum(1 for n, d in want.items() if got.get(n) == d)
+              print(f"{label}: {match} of {len(want)} files from the BitLocker volume match their source hashes")
+              assert match == len(want) == 612
+
       - name: Check the window starts and stays up
         shell: python
         run: |

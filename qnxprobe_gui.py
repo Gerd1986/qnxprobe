@@ -119,7 +119,8 @@ def run_window(initial_paths):
 
     # passwords: an encrypted image's password, by path, once it has opened the
     # image; kept in memory for this window only, never written anywhere
-    state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={})
+    state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={},
+                 bl_secrets={}, bl_keys={})
 
     def ask_password(path, wrong):
         """The password for an encrypted image, asked for on the main thread, or None
@@ -152,6 +153,44 @@ def run_window(initial_paths):
                 return False
             state["passwords"][path] = password
             return True
+
+    def unlock_volumes(path):
+        """Ask for the key of each BitLocker volume in the image that the keys kept so
+        far do not open: a password or recovery password, or, left empty, a startup
+        key (.BEK) file. A cancelled prompt leaves that volume locked. Keys are kept
+        in memory for this window only. False when the image cannot be read."""
+        secrets = state["bl_secrets"].setdefault(path, [])
+        keys = state["bl_keys"].setdefault(path, [])
+        try:
+            with q.open_image(path, password=state["passwords"].get(path)) as fh:
+                _fh, found = q.unlock_bitlocker(fh, q.image_size(fh), secrets, keys)
+                for bl in found:
+                    wrong = False
+                    usable = any(k in ("password", "recovery password", "startup key")
+                                 for k, _i in bl.protectors)
+                    while bl.fvek is None and not bl.why and usable:
+                        prompt = (("That does not open it. " if wrong else "")
+                                  + f"{bl.label} of {os.path.basename(os.path.normpath(path))} is "
+                                  f"BitLocker-encrypted. Its password or recovery password "
+                                  f"(leave empty to choose a startup key .BEK file):")
+                        answer = simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
+                        if answer is None:
+                            break
+                        if answer == "":
+                            key = filedialog.askopenfilename(
+                                title="BitLocker startup key",
+                                filetypes=[("BitLocker startup key", "*.BEK *.bek"), ("All files", "*")])
+                            if not key:
+                                break
+                            if bl.unlock((), [key]):
+                                keys.append(key)
+                        elif bl.unlock([answer], ()):
+                            secrets.append(answer)
+                        wrong = bl.fvek is None
+        except Exception as exc:            # pylint: disable=broad-exception-caught
+            messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
+            return False
+        return True
 
     # ---- top: images ------------------------------------------------------
     top = ttk.Frame(root, padding=8)
@@ -355,12 +394,16 @@ def run_window(initial_paths):
         # An encrypted image's password goes to the subprocess in its environment,
         # never on its command line, where the process list would show it.
         for path in paths:
-            if not unlock(path):
+            if not unlock(path) or not unlock_volumes(path):
                 return None
         env = dict(os.environ)
-        for n, path in enumerate(p for p in paths if p in state["passwords"]):
-            env[f"QNXPROBE_PASSWORD_{n}"] = state["passwords"][path]
+        given = [state["passwords"][p] for p in paths if p in state["passwords"]]
+        given += [x for p in paths for x in state["bl_secrets"].get(p, [])]
+        for n, secret in enumerate(given):
+            env[f"QNXPROBE_PASSWORD_{n}"] = secret
             args += ["--password-env", f"QNXPROBE_PASSWORD_{n}"]
+        for key in sorted({k for p in paths for k in state["bl_keys"].get(p, [])}):
+            args += ["--bitlocker-key", key]
         state["child_env"] = env
         return args + paths
 
@@ -470,12 +513,18 @@ def run_window(initial_paths):
         if not unlock(path):                 # an encrypted image, its password refused
             done_loading()
             return
+        if not unlock_volumes(path):         # a BitLocker volume's key asked for
+            done_loading()
+            return
 
         def work():
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
             try:
                 fh = q.open_image(path, password=state["passwords"].get(path))
+                fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
+                                                state["bl_secrets"].get(path, []),
+                                                state["bl_keys"].get(path, []))
                 q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
