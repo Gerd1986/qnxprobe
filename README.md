@@ -1021,6 +1021,7 @@ by its own first bytes rather than its name:
 | Apple sparse image, since 1.39 | the `.sparseimage` |
 | Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
 | any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
+| an E01, SMART or raw (dd) set FTK Imager encrypted with AD encryption, since 1.42 | the first file (`.E01`, `.s01`), or any `.001`, `.002`, ... of a raw set, with its password |
 
 A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
 has no trailer: it is the disk's bytes as they are, and has always been read as a raw
@@ -1035,7 +1036,13 @@ either, qnxprobe asks at a terminal. The window asks for it once per image and k
 in memory for the session, and hands it to the report it runs through an environment
 variable, never on a command line. From Python, `open_image(path, password=...)`
 raises `ImagePasswordError`, whose `wrong` says whether a password was given, when the
-image does not open. Before 1.41 an encrypted image was refused. A `.dmgpart` on
+image does not open. Before 1.41 an encrypted image was refused. Since 1.42 an E01,
+SMART or raw (dd) set FTK Imager encrypted with AD encryption opens the same way, with
+the same password options; `needs_password(path)` answers for both kinds, and
+`PASSWORD_FORMATS` names them as `acquisition_format` does (`DMG_ENCRYPTED`,
+`AD_ENCRYPTED`). Only the first file of such a set carries the encryption header, so
+a later numbered file of a raw set is recognised by its first. Before 1.42 an
+AD-encrypted set was read as raw bytes and nothing in it was recognised. A `.dmgpart` on
 its own is refused by the reader, which names the `.dmg` to open instead, and a split
 `.dmg` with a segment missing is refused rather than read short. A sparse bundle is
 recognised by its `Info.plist`, whatever the folder is called. Before 1.40 a sparse
@@ -1062,9 +1069,9 @@ files of an L01 (`python3 ewfprobe.py files evidence.L01`).
 This is `ewfprobe.py`, vendored from
 [abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
 `vendored.json`. It is MIT, pure Python and standard library only, so it adds
-nothing to build and nothing to install; only an LZFSE `.dmg` and an encrypted Apple
-disk image need an optional package, and the release executables carry the one for
-encrypted images. `tools/check_vendored.py` confirms the
+nothing to build and nothing to install; only an LZFSE `.dmg` and an encrypted image
+(an Apple disk image or an AD-encrypted acquisition) need an optional package, and the
+release executables carry the one for encrypted images. `tools/check_vendored.py` confirms the
 copy still matches what was vendored, and reports a copy it could not check
 separately from one that has drifted, because those are different results.
 
@@ -1093,8 +1100,8 @@ reported as not recognised, with its first bytes shown.
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
-| `--password-file FILE` | For an encrypted Apple disk image: a password, the first line of FILE. Repeatable |
-| `--password-env NAME` | For an encrypted Apple disk image: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal |
+| `--password-file FILE` | For an encrypted image (an Apple disk image or an AD-encrypted FTK Imager acquisition): a password, the first line of FILE. Repeatable |
+| `--password-env NAME` | For an encrypted image: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
@@ -1377,8 +1384,9 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
-- **It does not decrypt a filesystem.** An encrypted Apple disk image opens with its
-  password (above), because the encryption is the container's. A volume with encrypted
+- **It does not decrypt a filesystem.** An encrypted Apple disk image or an
+  AD-encrypted acquisition opens with its password (above), because the encryption is
+  the container's. A volume with encrypted
   filenames is flagged, not opened.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.

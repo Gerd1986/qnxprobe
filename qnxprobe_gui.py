@@ -125,14 +125,17 @@ def run_window(initial_paths):
         """The password for an encrypted image, asked for on the main thread, or None
         when the examiner cancels."""
         name = os.path.basename(os.path.normpath(path))
+        what = ("an acquisition FTK Imager encrypted with AD encryption"
+                if q.acquisition_format(path) == "AD_ENCRYPTED"
+                else "an encrypted Apple disk image")
         prompt = (f"That password does not open {name}. Its password:" if wrong else
-                  f"{name} is an encrypted Apple disk image. Its password:")
+                  f"{name} is {what}. Its password:")
         return simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
 
     def unlock(path):
         """Ask for an encrypted image's password until it opens the image, and keep
         it; True when it is kept (or not needed), False when the examiner cancels."""
-        if path in state["passwords"] or q.acquisition_format(path) != "DMG_ENCRYPTED":
+        if path in state["passwords"] or not q.needs_password(path):
             return True
         wrong = False
         while True:
