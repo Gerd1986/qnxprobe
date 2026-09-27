@@ -110,14 +110,45 @@ def check_discovery(paths):
 
 def run_window(initial_paths):
     import tkinter as tk
-    from tkinter import ttk, filedialog, messagebox
+    from tkinter import ttk, filedialog, messagebox, simpledialog
 
     root = tk.Tk()
     root.title(f"qnxprobe {q.QNXPROBE_VERSION}")
     root.geometry("1100x760")
     root.minsize(820, 560)
 
-    state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None)
+    # passwords: an encrypted image's password, by path, once it has opened the
+    # image; kept in memory for this window only, never written anywhere
+    state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={})
+
+    def ask_password(path, wrong):
+        """The password for an encrypted image, asked for on the main thread, or None
+        when the examiner cancels."""
+        name = os.path.basename(os.path.normpath(path))
+        prompt = (f"That password does not open {name}. Its password:" if wrong else
+                  f"{name} is an encrypted Apple disk image. Its password:")
+        return simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
+
+    def unlock(path):
+        """Ask for an encrypted image's password until it opens the image, and keep
+        it; True when it is kept (or not needed), False when the examiner cancels."""
+        if path in state["passwords"] or q.acquisition_format(path) != "DMG_ENCRYPTED":
+            return True
+        wrong = False
+        while True:
+            password = ask_password(path, wrong)
+            if password is None:
+                return False
+            try:
+                q.open_image(path, password=password).close()
+            except q.ImagePasswordError as exc:
+                wrong = exc.wrong
+                continue
+            except Exception as exc:        # pylint: disable=broad-exception-caught
+                messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
+                return False
+            state["passwords"][path] = password
+            return True
 
     # ---- top: images ------------------------------------------------------
     top = ttk.Frame(root, padding=8)
@@ -318,6 +349,16 @@ def run_window(initial_paths):
                 messagebox.showerror("qnxprobe", f"Refusing to overwrite an existing file:\n{zp}")
                 return None
             args += ["--extract", zp]
+        # An encrypted image's password goes to the subprocess in its environment,
+        # never on its command line, where the process list would show it.
+        for path in paths:
+            if not unlock(path):
+                return None
+        env = dict(os.environ)
+        for n, path in enumerate(p for p in paths if p in state["passwords"]):
+            env[f"QNXPROBE_PASSWORD_{n}"] = state["passwords"][path]
+            args += ["--password-env", f"QNXPROBE_PASSWORD_{n}"]
+        state["child_env"] = env
         return args + paths
 
     def pump(stream, tag):
@@ -338,7 +379,8 @@ def run_window(initial_paths):
             b["state"] = "disabled"
         b_cancel["state"] = "normal"
         try:
-            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             env=state.pop("child_env", None))
         except OSError as exc:
             messagebox.showerror("qnxprobe", f"could not start qnxprobe.py: {exc}")
             finish()
@@ -422,11 +464,15 @@ def run_window(initial_paths):
         b_load["state"] = "disabled"
         status["text"] = f"reading {os.path.basename(path)} ..."
 
+        if not unlock(path):                 # an encrypted image, its password refused
+            done_loading()
+            return
+
         def work():
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
             try:
-                fh = q.open_image(path)          # one file, or a split set joined
+                fh = q.open_image(path, password=state["passwords"].get(path))
                 q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
