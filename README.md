@@ -1016,6 +1016,18 @@ by its own first bytes rather than its name:
 | EWF2 (Ex01) | the `.Ex01` |
 | AFF | the `.aff` |
 | AFD, the folder of AFF files AFFLIB writes when an image is split | the `.afd` folder, or any `.aff` in it |
+| Apple disk image (UDIF), since 1.39 | the `.dmg` |
+| Apple sparse image, since 1.39 | the `.sparseimage` |
+
+A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
+has no trailer: it is the disk's bytes as they are, and has always been read as a raw
+image. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
+ewfprobe, and is refused, naming it, without. An encrypted Apple disk image is
+refused: it needs its password. Before 1.39 a `.dmg` or `.sparseimage` was read as raw
+bytes; made from one test volume in every format `hdiutil` writes, the compressed ones
+(UDZO, UDBZ, ULMO, ULFO, UDCO), UDRO, the sparse image and an encrypted image all came
+back `not recognised`, and only the three that hold the disk's bytes in order (UDRW,
+`.cdr` and UFBI) were read.
 
 Before 1.38 only the E01 signature was recognised. An Ex01, AFF, AFD or L01 was
 read as raw bytes, and on every test acquisition of each that found no filesystem
@@ -1323,8 +1335,8 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 ## What it does not do
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
-  is one file or the numbered segments of one, and an E01, s01, Ex01, AFF or AFD is
-  read through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
+  is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, `.dmg`
+  or `.sparseimage` is read through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
   Lx01 logical evidence is refused, since it holds no disk. AFF4, AD1 and the other
   evidence containers are not decoded; such a file is read as plain raw bytes, so
   export the raw image from the imaging tool first. A segment set is joined only when it is whole from its first
