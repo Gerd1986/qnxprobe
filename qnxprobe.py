@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.43"
+QNXPROBE_VERSION = "1.44"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -190,6 +190,7 @@ _ACQUISITION_NAMES = {
     "EWF2": "an EWF2 acquisition (.Ex01)",
     "AFF": "an AFF acquisition (.aff)",
     "AFD": "an AFD acquisition (a .afd folder of AFF files)",
+    "AFF4": "an AFF4 acquisition (.aff4)",
     "UDIF": "an Apple disk image (.dmg)",
     "SPARSEIMAGE": "an Apple sparse image (.sparseimage)",
     "SPARSEBUNDLE": "an Apple sparse bundle (a .sparsebundle folder)",
@@ -197,6 +198,31 @@ _ACQUISITION_NAMES = {
     "AD_ENCRYPTED": "an acquisition FTK Imager encrypted with AD encryption (.E01, .s01 "
                     "or .001)",
 }
+
+
+ZIP_SIGNATURE = b"PK\x03\x04"
+
+
+def _is_aff4(path):
+    """ewfprobe's test when it is here; without it, the same two places it reads
+    (the first member's name, and the ZIP comment), so an AFF4 is still refused as
+    an acquisition rather than read as the bytes of a ZIP."""
+    if ewfprobe is not None and hasattr(ewfprobe, "is_aff4"):
+        return ewfprobe.is_aff4(path)
+    try:
+        with open(path, "rb") as fh:
+            head = fh.read(30)
+            if head[:4] != ZIP_SIGNATURE:
+                return False
+            if fh.read(struct.unpack_from("<H", head, 26)[0]) == b"container.description":
+                return True
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - 65557))
+            tail = fh.read()
+    except (OSError, struct.error):
+        return False
+    at = tail.rfind(b"PK\x05\x06")
+    return at >= 0 and tail[at + 22:at + 29] == b"aff4://"
 
 
 def _first_bytes(path, n=8):
@@ -257,9 +283,12 @@ def needs_password(path):
 
 
 def acquisition_format(path):
-    """What acquisition container path is: "EWF", "EWF2", "AFF", "AFD", "UDIF",
-    "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "DMG_ENCRYPTED" or
-    "AD_ENCRYPTED", or None for anything else, which is read as a raw image.
+    """What acquisition container path is: "EWF", "EWF2", "AFF", "AFD", "AFF4",
+    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "DMG_ENCRYPTED" or
+    "AD_ENCRYPTED", or None for anything else, which is read as a raw image. An
+    AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
+    Standard (5.4) has its writer put in the ZIP comment or in a first member
+    named container.description.
 
     An AFD is a folder whose name ends .afd holding AFF files, the form AFFLIB
     writes when an image is split; it is recognised from the folder or from any
@@ -298,6 +327,8 @@ def acquisition_format(path):
         return "AD_ENCRYPTED"
     if head[:4] == SPARSEIMAGE_SIGNATURE:
         return "SPARSEIMAGE"
+    if head[:4] == ZIP_SIGNATURE and _is_aff4(path):
+        return "AFF4"
     try:
         size = os.path.getsize(path)
         if size >= 512:
@@ -563,6 +594,7 @@ _ACQUISITION_LABELS = {
     "EWF2-Ex01": "an EWF2 (Ex01) acquisition",
     "AFF": "an AFF acquisition",
     "AFD": "an AFD acquisition",
+    "AFF4": "an AFF4 acquisition",
     "UDIF": "an Apple disk image",
     "SPARSEIMAGE": "an Apple sparse image",
     "SPARSEBUNDLE": "an Apple sparse bundle",
@@ -585,7 +617,8 @@ def describe_acquisition(image):
         return (f"an Apple sparse bundle of {stored:,} stored band "
                 f"file{'' if stored == 1 else 's'}, read by the reader{locked}")
     label = _ACQUISITION_LABELS.get(fmt, "an acquisition")
-    unit = "files" if fmt in ("AFF", "AFD", "UDIF", "SPARSEIMAGE", "UDRW") else "segments"
+    unit = ("files" if fmt in ("AFF", "AFD", "AFF4", "UDIF", "SPARSEIMAGE", "UDRW")
+            else "segments")
     if len(parts) > 1:
         return (f"{label} of {len(parts)} {unit}, joined by the reader: "
                 f"{os.path.basename(parts[0])} .. {os.path.basename(parts[-1])}{locked}")
@@ -3999,6 +4032,12 @@ APFS_PRIMED_TYPES = frozenset((APFS_TYPE_INODE, APFS_TYPE_XATTR, APFS_TYPE_DIR_R
 APFS_PRIME_MAX_RECORDS = 4_000_000
 
 APFS_INCOMPAT_CASE_INSENSITIVE          = 0x0000000000000001
+# apfs_superblock_t.apfs_fs_flags, and its "volume isn't encrypted" bit (Apple File
+# System Reference, 2020-06-22: apfs_superblock_t and Volume Flags). A volume
+# without the bit is encrypted; whether its blocks are ciphertext in an image is
+# a separate question, answered from the blocks (ApfsWalker.encryption).
+APFS_FS_FLAGS_OFF                       = 264
+APFS_FS_UNENCRYPTED                     = 0x0000000000000001
 APFS_INCOMPAT_NORMALIZATION_INSENSITIVE = 0x0000000000000008
 
 APFS_INO_EXT_TYPE_DSTREAM = 8   # the extended field holding a file's size
@@ -4037,13 +4076,18 @@ def _apfs_fletcher_ok(block):
     """
     if len(block) < APFS_OBJ_HDR:
         return False
+    return struct.unpack_from("<Q", block, 0)[0] == _apfs_fletcher(block)
+
+
+def _apfs_fletcher(block):
+    """The Fletcher-64 checksum of everything after a block's first eight bytes."""
     lo = hi = 0
     for off in range(8, len(block) - 3, 4):
         lo = (lo + struct.unpack_from("<I", block, off)[0]) % 0xFFFFFFFF
         hi = (hi + lo) % 0xFFFFFFFF
     c1 = (0xFFFFFFFF - ((lo + hi) % 0xFFFFFFFF)) % 0xFFFFFFFF
     c2 = (0xFFFFFFFF - ((lo + c1) % 0xFFFFFFFF)) % 0xFFFFFFFF
-    return struct.unpack_from("<Q", block, 0)[0] == ((c2 << 32) | c1)
+    return (c2 << 32) | c1
 
 
 class _ApfsBtree:
@@ -4167,9 +4211,10 @@ class ApfsWalker:
     and their extended fields, file extents including sparse ones, symbolic
     links, and files compressed with the decmpfs attribute in its zlib forms.
 
-    What it does not read: an encrypted volume, and a file compressed with LZVN
-    or LZFSE, which are not in the standard library. Both are reported rather
-    than guessed at.
+    What it does not read: an encrypted volume whose blocks are ciphertext in
+    the image, and a file compressed with LZVN or LZFSE, which are not in the
+    standard library. Both are reported rather than guessed at. An encrypted
+    volume whose blocks the image holds decrypted is read (see encryption()).
     """
 
     root = APFS_CONTAINER
@@ -4208,10 +4253,18 @@ class ApfsWalker:
         if not self.volumes:
             raise ValueError("the container names no readable volume")
         self._state = {}
+        self._crypt = {}                            # volume index -> encryption()
         self._current = None
         self._primed = None                         # prime_records() fills it
         self._fext = None
-        self._open_volume(0)
+        # what _open_volume sets, for a container whose every volume is locked
+        self._volume_omap, self._tree, self._inodes = {}, None, {}
+        self._hashed_names = self.case_insensitive = self.sealed = False
+        self.volume_name, self.fs_root_block = None, None
+        first = next((i for i in range(len(self.volumes))
+                      if self.encryption(i) != "locked"), None)
+        if first is not None:
+            self._open_volume(first)
 
     # -- volumes -----------------------------------------------------------
     def _open_volume(self, index):
@@ -4219,6 +4272,11 @@ class ApfsWalker:
         map and file-system tree the first time it is asked for."""
         if self._current == index:
             return
+        if self.encryption(index) == "locked":
+            # every route to a volume's tree comes through here, so a locked one is
+            # never parsed: ciphertext read as a tree returns nothing, silently
+            raise ApfsUnreadable(f"volume {index} is encrypted and its blocks are "
+                                 f"ciphertext in this image")
         got = self._state.get(index)
         if got is None:
             _oid, block, _name, incompat = self.volumes[index]
@@ -4285,10 +4343,60 @@ class ApfsWalker:
 
     def _select(self, node):
         vol, oid = self._split(node)
-        if vol >= len(self.volumes):
+        if vol >= len(self.volumes) or self.encryption(vol) == "locked":
             return None
         self._open_volume(vol)
         return oid
+
+    def encryption(self, index):
+        """None for a volume its flags say is not encrypted. For an encrypted one,
+        "clear" when its file-system tree's root node passes its checksum here, so
+        the image holds its blocks decrypted (an acquisition read through the Mac's
+        own decryption, as BlackBag's Digital Collector reads one, stores them so),
+        and "locked" when it does not, because they are ciphertext. A locked volume
+        is not walked: parsing ciphertext as a tree returns nothing, and returning
+        nothing reads as an empty volume."""
+        if index in self._crypt:
+            return self._crypt[index]
+        _oid, block, _name, _incompat = self.volumes[index]
+        sb = self.block(block)
+        state = None
+        if not struct.unpack_from("<Q", sb, APFS_FS_FLAGS_OFF)[0] & APFS_FS_UNENCRYPTED:
+            vol_omap_oid, root_oid = struct.unpack_from("<QQ", sb, 128)
+            saved = self._current, self._volume_omap
+            ok = False
+            try:
+                # as in _open_volume: the volume's own map is read with nothing current
+                self._current, self._volume_omap = None, {}
+                root_block = self._read_omap(vol_omap_oid).get(root_oid)
+                ok = root_block is not None and _apfs_fletcher_ok(self.block(root_block))
+            except (ValueError, OSError, struct.error):
+                ok = False
+            finally:
+                self._current, self._volume_omap = saved
+            state = "clear" if ok else "locked"
+        self._crypt[index] = state
+        return state
+
+    @property
+    def note(self):
+        """What a report should say about the container's encrypted volumes, or
+        None when none is encrypted."""
+        parts = []
+        for state, text in (
+                ("locked", "{} encrypted, and {} blocks are ciphertext in this image, "
+                           "so {} files are not listed or extracted"),
+                ("clear", "{} flagged encrypted, but {} blocks read in the clear in "
+                          "this image, as an acquisition made through the Mac's own "
+                          "decryption stores them, so {} files are read as they are")):
+            names = [self.volumes[i][2] or f"volume {i}" for i in range(len(self.volumes))
+                     if self.encryption(i) == state]
+            if names:
+                one = len(names) == 1
+                parts.append(text.format(f"{', '.join(names)} {'is' if one else 'are'}",
+                                         "its" if one else "their",
+                                         "its" if one else "their"))
+        return "; ".join(parts) or None
 
     # -- blocks and object maps -------------------------------------------
     def block(self, n):
@@ -9580,9 +9688,14 @@ def identify_apfs(fh, base):
     for i, (_oid, blk, name, incompat) in enumerate(w.volumes):
         sb = w.block(blk)
         used = struct.unpack_from("<Q", sb, 88)[0] * w.block_size
+        state = w.encryption(i)
         lines.append(f"  {i}  {name or '(unnamed)'}   {human(used)} used"
                      + ("   case sensitive"
-                        if not incompat & APFS_INCOMPAT_CASE_INSENSITIVE else ""))
+                        if not incompat & APFS_INCOMPAT_CASE_INSENSITIVE else "")
+                     + ("   encrypted, read in the clear" if state == "clear" else
+                        "   encrypted and locked, not read" if state == "locked" else ""))
+    if w.note:
+        lines.append(f"note         {w.note}")
     return "apfs", lines
 
 
@@ -15226,12 +15339,12 @@ def self_test():
                 want = {}
                 with open(os.path.join(fx, lst), encoding="utf-8") as fh_:
                     for line in fh_:
-                        d, pth = line.rstrip("\n").split("  ", 1)
-                        want[prefix + pth] = d
+                        digest, pth = line.rstrip("\n").split("  ", 1)
+                        want[prefix + pth] = digest
                 got = {pth: (i, sz) for pth, i, sz, _m in (collect(w, w.root) if w else [])
                        if sz is not None}
-                okn = sum(1 for pth, d in want.items() if pth in got and _hl.sha256(
-                    b"".join(w.read_file(*got[pth]))).hexdigest() == d)
+                okn = sum(1 for pth, digest in want.items() if pth in got and _hl.sha256(
+                    b"".join(w.read_file(*got[pth]))).hexdigest() == digest)
                 geo = getattr(w, "nand", None)
                 ocond = okn == len(want) and geo == (2048, 64)
                 if not ocond:
@@ -15567,6 +15680,161 @@ def self_test():
                       f"all but its own fields, or Windows Vista's NTFS-like one) is taken for "
                       f"neither a FAT32 volume nor a partition table")
 
+        # ---- AFF4 and encrypted APFS volumes --------------------------
+        import hashlib as _hl4, io as _io4  # pylint: disable=import-outside-toplevel
+        _gz4, _zf4 = gzip, zipfile
+        sq_fix = os.path.join(here, "squashfs-small.img.gz")
+        if (ewfprobe is None or not hasattr(ewfprobe, "is_aff4")
+                or not os.path.isfile(sq_fix)):
+            print("  [SKIP] an AFF4 acquisition reads as the image it holds (needs the "
+                  "vendored ewfprobe and the SquashFS fixture)")
+        else:
+            with _gz4.open(sq_fix, "rb") as g:
+                sq_raw = g.read()
+            with open(os.path.join(here, "squashfs.src.sha256"), encoding="utf-8") as handle:
+                sq_sums = dict(reversed(line.rstrip("\n").split("  ", 1))
+                               for line in handle if line.strip())
+            # A small AFF4 Standard v1.0 container written here, around the fixture:
+            # stored chunks, a map of one range, and the metadata that names them.
+            vol_u, st_u, map_u, img_u = (f"aff4://0a4f4000-0000-4000-8000-00000000000{k}"
+                                         for k in "1234")
+            chunk, per = 32768, 16
+            parts = [sq_raw[i:i + chunk].ljust(chunk, b"\0")
+                     for i in range(0, len(sq_raw), chunk)]
+            aff4_path = os.path.join(d, "wrapped.aff4")
+            with _zf4.ZipFile(aff4_path, "w", _zf4.ZIP_STORED) as z:
+                z.writestr("container.description", vol_u)
+                for b in range(0, len(parts), per):
+                    name = st_u.replace("aff4://", "aff4%3A%2F%2F") + f"/{b // per:08d}"
+                    z.writestr(name, b"".join(parts[b:b + per]))
+                    z.writestr(name + ".index", b"".join(struct.pack("<QI", k * chunk, chunk)
+                                                         for k in range(len(parts[b:b + per]))))
+                mname = map_u.replace("aff4://", "aff4%3A%2F%2F")
+                z.writestr(mname + "/map", struct.pack("<QQQI", 0, len(sq_raw), 0, 0))
+                z.writestr(mname + "/idx", st_u + "\n")
+                z.writestr("information.turtle", (
+                    "@prefix aff4: <http://aff4.org/Schema#> .\n"
+                    f"<{img_u}> a aff4:DiskImage, aff4:Image ; aff4:dataStream <{map_u}> .\n"
+                    f"<{map_u}> a aff4:Map ; aff4:size {len(sq_raw)} .\n"
+                    f"<{st_u}> a aff4:ImageStream ; aff4:size {len(sq_raw)} ; "
+                    f"aff4:chunkSize {chunk} ; aff4:chunksInSegment {per} ; "
+                    f"aff4:compressionMethod aff4:NullCompressor .\n"))
+                z.comment = vol_u.encode()
+            plain_zip = os.path.join(d, "plain.zip")
+            with _zf4.ZipFile(plain_zip, "w") as z:
+                z.writestr("information.turtle", "not AFF4")
+            aff4_matched, aff4_desc, aff4_kind = 0, "", None
+            try:
+                with open_image(aff4_path) as handle:
+                    aff4_desc = describe_acquisition(handle)
+                    vol = volumes(handle)[0]
+                    aff4_kind, walker = vol["kind"], vol.get("walker")
+                    if walker is not None:
+                        got = {p: (n, sz) for p, n, _m, sz, _t, _r in walk_all(walker)}
+                        for path, digest in sq_sums.items():
+                            g = got.get(path)
+                            if g and _hl4.sha256(b"".join(walker.read_file(*g))).hexdigest() == digest:
+                                aff4_matched += 1
+            except Exception as exc:                 # pylint: disable=broad-except
+                aff4_desc = f"raised {type(exc).__name__}: {exc}"
+            for label, cond in (
+                    ("an AFF4 container is recognised as one, and a ZIP that only looks "
+                     "like it is not", acquisition_format(aff4_path) == "AFF4"
+                     and acquisition_format(plain_zip) is None),
+                    (f"an AFF4 acquisition reads as the image it holds ({aff4_kind}, "
+                     f"{aff4_matched}/{len(sq_sums)} files)",
+                     aff4_kind == "squashfs" and aff4_matched == len(sq_sums)
+                     and aff4_desc.startswith("an AFF4 acquisition"))):
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+        apfs_enc = os.path.join(here, "apfs-encrypted.sparseimage.gz")
+        if ewfprobe is None or not os.path.isfile(apfs_enc):
+            print("  [SKIP] an encrypted APFS volume is named, not walked (needs the "
+                  "vendored ewfprobe and the encrypted APFS fixture)")
+        else:
+            enc_path = os.path.join(d, "apfs-encrypted.sparseimage")
+            with _gz4.open(apfs_enc, "rb") as g, open(enc_path, "wb") as out:
+                shutil.copyfileobj(g, out)
+            with open(os.path.join(here, "apfs-encrypted.sha256"), encoding="utf-8") as handle:
+                enc_sums = {"PLAINVOL/" + path: digest for digest, path in
+                            (line.rstrip("\n").split("  ", 1) for line in handle if line.strip())}
+            enc_states, enc_note, enc_matched, enc_secret = [], "", 0, -1
+            enc_parsed, enc_report = True, []
+            try:
+                with open_image(enc_path) as handle:
+                    vol = [v for v in volumes(handle) if v["kind"] == "apfs"][0]
+                    w = vol["walker"]
+                    enc_states = [w.encryption(i) for i in range(len(w.volumes))]
+                    enc_note = vol.get("note", "")
+                    enc_report = identify_fs(handle, vol["base"], vol["size"])[1]
+                    got = {p: (n, sz) for p, n, _m, sz, _t, _r in walk_all(w)}
+                    enc_secret = sum(1 for p in got if p.startswith("SECRETVOL"))
+                    # its tree was never parsed: ciphertext read as a tree returns
+                    # nothing, which is what hid it before
+                    enc_parsed = 1 in w._state          # pylint: disable=protected-access
+                    for path, digest in enc_sums.items():
+                        g = got.get(path)
+                        if g and _hl4.sha256(b"".join(w.read_file(*g))).hexdigest() == digest:
+                            enc_matched += 1
+            except Exception as exc:                 # pylint: disable=broad-except
+                enc_note = f"raised {type(exc).__name__}: {exc}"
+            cond = (enc_states == [None, "locked"] and enc_secret == 0 and not enc_parsed
+                    and enc_matched == len(enc_sums) and enc_matched > 0
+                    and "SECRETVOL is encrypted, and its blocks are ciphertext" in enc_note
+                    and any("SECRETVOL" in ln and "locked" in ln for ln in enc_report)
+                    and any(ln.startswith("note") and "ciphertext" in ln for ln in enc_report))
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] an APFS volume macOS encrypted is named "
+                  f"locked and not walked, and the plain volume beside it reads "
+                  f"({enc_matched}/{len(enc_sums)} files, {enc_states})")
+
+        apfs_fix = os.path.join(here, "apfs-fixture.img.gz")
+        if not os.path.isfile(apfs_fix):
+            print("  [SKIP] an APFS volume flagged encrypted but held in the clear is "
+                  "read (needs the APFS fixture)")
+        else:
+            with _gz4.open(apfs_fix, "rb") as g:
+                apfs_raw = bytearray(g.read())
+            w0 = ApfsWalker(_io4.BytesIO(bytes(apfs_raw)), 0)
+            bs, blk = w0.block_size, w0.volumes[0][1]
+            sb = bytearray(apfs_raw[blk * bs:(blk + 1) * bs])
+            flags = struct.unpack_from("<Q", sb, APFS_FS_FLAGS_OFF)[0]
+            was_plain = bool(flags & APFS_FS_UNENCRYPTED)
+            # the shape an acquisition through the Mac's own decryption leaves: the
+            # flag says encrypted, the blocks are in the clear
+            struct.pack_into("<Q", sb, APFS_FS_FLAGS_OFF, flags & ~APFS_FS_UNENCRYPTED)
+            struct.pack_into("<Q", sb, 0, _apfs_fletcher(sb))
+            apfs_raw[blk * bs:(blk + 1) * bs] = sb
+            w1 = ApfsWalker(_io4.BytesIO(bytes(apfs_raw)), 0)
+            n0 = sum(1 for _ in walk_all(w0))
+            n1 = sum(1 for _ in walk_all(w1))
+            cond = (was_plain and n0 > 0 and n1 == n0 and w1.encryption(0) == "clear"
+                    and "flagged encrypted, but its blocks read in the clear" in (w1.note or ""))
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] an APFS volume flagged encrypted whose "
+                  f"blocks the image holds in the clear is read ({n1} of {n0} entries)")
+            # and the same volume with its tree's root node as ciphertext would be
+            root = w1.fs_root_block
+            noise = b"".join(_hl4.sha256(b"%d" % k).digest() for k in range(bs // 32))
+            apfs_raw[root * bs:(root + 1) * bs] = noise
+            try:
+                w2 = ApfsWalker(_io4.BytesIO(bytes(apfs_raw)), 0)
+                n2 = sum(1 for _ in walk_all(w2))
+                cond = (w2.encryption(0) == "locked" and n2 == 0
+                        and "ciphertext" in (w2.note or "")
+                        and 0 not in w2._state)          # pylint: disable=protected-access
+                detail = f"{n2} entries"
+            except Exception as exc:                 # pylint: disable=broad-except
+                cond, detail = False, f"raised {type(exc).__name__}: {exc}"
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] an encrypted APFS volume whose tree does "
+                  f"not pass its checksum is locked, as the first volume too ({detail})")
+
         print()
         print("  SELF-TEST PASSED. The detector reports positives and negatives"
               if ok else
@@ -15653,7 +15921,9 @@ listing contents:
   flood the terminal. An NTFS or APFS listing also names anything held in a
   stream beside the file, and an HFS+ one names a resource fork that carries
   anything. An APFS container is listed as a directory of its volumes, so every
-  volume in it is walked.
+  volume in it is walked, except an encrypted one whose blocks are ciphertext in
+  the image, which is named and not walked. An encrypted one the image holds
+  decrypted (its tree's root node passes its checksum) is walked and said to be.
 
 what it reports:
   Every superblock copy it can find, grouped into generations by serial. The
@@ -15893,6 +16163,12 @@ what it checks, and where the constants come from:
   Checked against 13 volumes Windows 11 wrote (NTFS, FAT32, exFAT; AES-CBC
   and AES-XTS at 128 and 256 bits; password, recovery password, startup key,
   clear key; conversions paused while encrypting and decrypting).
+
+  For APFS encryption, from Apple's Apple File System Reference (2020-06-22):
+  the volume flags, APFS_FS_UNENCRYPTED    apfs_superblock_t, "Volume Flags"
+  An encrypted volume is told locked or in the clear by its tree's root node's
+  Fletcher-64 checksum, checked against a volume macOS encrypted and against
+  Digital Collector's AFF4 of an Apple silicon Mac.
 
   --list walks qnx6 through the same block resolution the kernel uses in
   qnx6_block_map(), including multi-level indirect trees and long filenames
