@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.45"
+QNXPROBE_VERSION = "1.46"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -168,6 +168,17 @@ AFF_SIGNATURE  = b"AFF10\x0d\x0a\x00"           # AFF, and every file of an AFD
 L01_SIGNATURE  = b"LVF\x09\x0d\x0a\xff\x00"     # EnCase logical evidence (L01)
 LX01_SIGNATURE = b"LEF2\x0d\x0a\x81\x00"        # EWF2 logical evidence (Lx01)
 AD1_SIGNATURE  = b"ADSEGMENTEDFILE\x00"        # FTK Imager logical evidence, every file
+# Virtual machine disks. A VHD ends in a 512-byte footer beginning "conectix" (511
+# bytes in images older than Virtual PC 2004), and a dynamic or differencing one also
+# begins with a copy of it; a VHDX begins "vhdxfile"; a VMDK is a text descriptor
+# beginning "# Disk DescriptorFile" or a sparse extent beginning "KDMV" (ESXi's
+# "COWD"); a QCOW begins "QFI\xfb" and its version, 1, 2 or 3.
+VHD_COOKIE = b"conectix"
+VHDX_SIGNATURE = b"vhdxfile"
+VMDK_DESCRIPTOR_START = b"# Disk DescriptorFile"
+VMDK_SPARSE_MAGIC = b"KDMV"
+VMDK_COWD_MAGIC = b"COWD"
+QCOW_MAGIC = b"QFI\xfb"
 # Apple disk images. A UDIF image (.dmg) ends in a 512-byte trailer beginning
 # "koly"; an uncompressed read-write image has none and is plain disk bytes, read
 # as raw. A .dmgpart segment of a split .dmg ends in one too, and the reader names
@@ -198,6 +209,10 @@ _ACQUISITION_NAMES = {
     "DMG_ENCRYPTED": "an encrypted Apple disk image (.dmg, .sparseimage or .sparsebundle)",
     "AD_ENCRYPTED": "an acquisition FTK Imager encrypted with AD encryption (.E01, .s01, "
                     ".001 or .ad1)",
+    "VHD": "a Microsoft virtual hard disk (.vhd)",
+    "VHDX": "a Microsoft virtual hard disk (.vhdx)",
+    "VMDK": "a VMware virtual disk (.vmdk)",
+    "QCOW": "a QEMU virtual disk (.qcow or .qcow2)",
 }
 
 
@@ -224,6 +239,35 @@ def _is_aff4(path):
         return False
     at = tail.rfind(b"PK\x05\x06")
     return at >= 0 and tail[at + 22:at + 29] == b"aff4://"
+
+
+def _virtual_disk_kind(path):
+    """ewfprobe's answer when it is here ("VHD", "VHDX", "VMDK", "QCOW" or None);
+    without it, the same bytes it reads (the first 512 and the last 512), so a
+    virtual disk is still refused as one rather than read as its container's bytes."""
+    if ewfprobe is not None and hasattr(ewfprobe, "virtual_disk_kind"):
+        return ewfprobe.virtual_disk_kind(path)
+    if os.path.isdir(path):
+        return None
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(512)
+            fh.seek(max(0, size - 512))
+            tail = fh.read(512)
+    except OSError:
+        return None
+    text = head[3:] if head.startswith(b"\xef\xbb\xbf") else head
+    if head[:8] == VHDX_SIGNATURE:
+        return "VHDX"
+    if (head[:4] in (VMDK_SPARSE_MAGIC, VMDK_COWD_MAGIC)
+            or text[:len(VMDK_DESCRIPTOR_START)].lower() == VMDK_DESCRIPTOR_START.lower()):
+        return "VMDK"
+    if head[:4] == QCOW_MAGIC and head[4:8] in (b"\0\0\0\1", b"\0\0\0\2", b"\0\0\0\3"):
+        return "QCOW"
+    if VHD_COOKIE in (tail[:8], tail[1:9], head[:8]):
+        return "VHD"
+    return None
 
 
 def _first_bytes(path, n=8):
@@ -301,8 +345,9 @@ def needs_password(path):
 
 def acquisition_format(path):
     """What acquisition container path is: "EWF", "EWF2", "AFF", "AFD", "AFF4",
-    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "AD1", "DMG_ENCRYPTED" or
-    "AD_ENCRYPTED", or None for anything else, which is read as a raw image. An
+    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "AD1", "DMG_ENCRYPTED",
+    "AD_ENCRYPTED", or a virtual machine disk, "VHD", "VHDX", "VMDK" or "QCOW", or
+    None for anything else, which is read as a raw image. An
     AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
     Standard (5.4) has its writer put in the ZIP comment or in a first member
     named container.description.
@@ -313,6 +358,8 @@ def acquisition_format(path):
     is a folder too, recognised by its Info.plist whatever it is called. L01, Lx01
     and FTK Imager's AD1 are logical evidence: they hold copies of files, not a
     disk. An AD-encrypted AD1 set is recognised from any of its files by its .ad1.
+    A VMDK is recognised from its descriptor or from any of its sparse extents; a
+    flat extent holds the disk's bytes as they are and is read as raw.
     """
     if os.path.isdir(path):
         bundle = _sparsebundle_kind(path)
@@ -349,6 +396,9 @@ def acquisition_format(path):
         return "SPARSEIMAGE"
     if head[:4] == ZIP_SIGNATURE and _is_aff4(path):
         return "AFF4"
+    virtual = _virtual_disk_kind(path)
+    if virtual:
+        return virtual
     try:
         size = os.path.getsize(path)
         if size >= 512:
@@ -632,6 +682,10 @@ _ACQUISITION_LABELS = {
     "SPARSEBUNDLE": "an Apple sparse bundle",
     "UDRW": "an Apple read-write disk image",
     "RAW": "a raw (dd) image",
+    "VHD": "a VHD virtual disk",
+    "VHDX": "a VHDX virtual disk",
+    "VMDK": "a VMDK virtual disk",
+    "QCOW": "a QCOW virtual disk",
 }
 
 
@@ -649,12 +703,46 @@ def describe_acquisition(image):
         return (f"an Apple sparse bundle of {stored:,} stored band "
                 f"file{'' if stored == 1 else 's'}, read by the reader{locked}")
     label = _ACQUISITION_LABELS.get(fmt, "an acquisition")
-    unit = ("files" if fmt in ("AFF", "AFD", "AFF4", "UDIF", "SPARSEIMAGE", "UDRW")
+    unit = ("files" if fmt in ("AFF", "AFD", "AFF4", "UDIF", "SPARSEIMAGE", "UDRW",
+                               "VHD", "VHDX", "VMDK", "QCOW")
             else "segments")
+    # a differencing disk, delta or overlay is read through the disks under it
+    parents = [os.path.basename((getattr(q, "paths", None) or ["?"])[0])
+               for q in _parent_chain(image)]
+    over = ""
+    if len(parents) == 1:
+        over = f", over its parent {parents[0]}"
+    elif parents:
+        over = f", over its parents {', '.join(parents)} (nearest first)"
     if len(parts) > 1:
         return (f"{label} of {len(parts)} {unit}, joined by the reader: "
-                f"{os.path.basename(parts[0])} .. {os.path.basename(parts[-1])}{locked}")
-    return f"{label} of one {unit[:-1]}{locked}"
+                f"{os.path.basename(parts[0])} .. {os.path.basename(parts[-1])}"
+                f"{over}{locked}")
+    return f"{label} of one {unit[:-1]}{over}{locked}"
+
+
+def _parent_chain(image):
+    """The disks a virtual disk is read over (a differencing VHD or VHDX's parent, a
+    VMDK delta's, a QCOW overlay's backing file), nearest first; [] for any other
+    image. The reader caps a chain's length, and so does this."""
+    out, parent = [], getattr(image, "parent", None)
+    while parent is not None and len(out) < 64:
+        out.append(parent)
+        parent = getattr(parent, "parent", None)
+    return out
+
+
+def image_parents(image):
+    """Every file of the disks a virtual disk is read over, nearest disk first, each
+    as {"name", "bytes"}; [] for any other image."""
+    out = []
+    for parent in _parent_chain(image):
+        for q in list(getattr(parent, "paths", []) or []):
+            try:
+                out.append({"name": os.path.basename(q), "bytes": os.path.getsize(q)})
+            except OSError:
+                out.append({"name": os.path.basename(q), "bytes": None})
+    return out
 
 
 def describe_segment_sizes(sizes):
@@ -10958,6 +11046,9 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
             part_sizes = [os.path.getsize(q) for q in parts]
         image_rec["image_segments"] = [{"name": os.path.basename(q), "bytes": s}
                                        for q, s in zip(parts, part_sizes)]
+        parent_files = image_parents(image)
+        if parent_files:
+            image_rec["image_parents"] = parent_files
 
     candidates, regions, sized_regions, triage = [], [], [], []
     containers, protective = set(), set()
@@ -13251,6 +13342,12 @@ def self_test():
             "ADCRYPT_SIGNATURE": (ADCRYPT_SIGNATURE, b"ADCRYPT\x00"),
             "AD1_SIGNATURE": (AD1_SIGNATURE, b"ADSEGMENTEDFILE\x00"),
             "SPARSEBUNDLE_TYPE": (SPARSEBUNDLE_TYPE, "com.apple.diskimage.sparsebundle"),
+            "VHD_COOKIE": (VHD_COOKIE, b"conectix"),
+            "VHDX_SIGNATURE": (VHDX_SIGNATURE, b"vhdxfile"),
+            "VMDK_DESCRIPTOR_START": (VMDK_DESCRIPTOR_START, b"# Disk DescriptorFile"),
+            "VMDK_SPARSE_MAGIC": (VMDK_SPARSE_MAGIC, b"KDMV"),
+            "VMDK_COWD_MAGIC": (VMDK_COWD_MAGIC, b"COWD"),
+            "QCOW_MAGIC": (QCOW_MAGIC, b"QFI\xfb"),
         }
         for const, (have, want) in TRUE_SIGS.items():
             if have != want:
@@ -13290,6 +13387,41 @@ def self_test():
         ad1_enc = _fake(os.path.join("ad1enc", "enc.AD1"), TRUE_SIGS["ADCRYPT_SIGNATURE"][1])
         ad1_enc_second = _fake(os.path.join("ad1enc", "enc.ad2"), b"\x5a" * 16)
         ad1_lone = _fake(os.path.join("ad1lone", "lone.ad2"), b"\x5a" * 16)
+        # Virtual machine disks: each begins, or for a fixed VHD ends, with its own
+        # bytes; everything else in these files is zeros, so each is damaged.
+        vhd_fixed_fake = os.path.join(d, "vd", "fixed.vhd")
+        os.makedirs(os.path.dirname(vhd_fixed_fake), exist_ok=True)
+        with open(vhd_fixed_fake, "wb") as fh:
+            fh.write(b"\x00" * 4096 + TRUE_SIGS["VHD_COOKIE"][1] + b"\x00" * 504)
+        vhd_dynamic_fake = _fake(os.path.join("vd", "dynamic.vhd"), TRUE_SIGS["VHD_COOKIE"][1])
+        vhdx_fake = _fake(os.path.join("vd", "fake.vhdx"), TRUE_SIGS["VHDX_SIGNATURE"][1])
+        vmdk_desc_fake = _fake(os.path.join("vd", "fake.vmdk"),
+                               TRUE_SIGS["VMDK_DESCRIPTOR_START"][1] + b"\n")
+        vmdk_sparse_fake = _fake(os.path.join("vd", "fake-s001.vmdk"),
+                                 TRUE_SIGS["VMDK_SPARSE_MAGIC"][1])
+        vmdk_cowd_fake = _fake(os.path.join("vd", "fake-cowd.vmdk"),
+                               TRUE_SIGS["VMDK_COWD_MAGIC"][1])
+        qcow_fake = _fake(os.path.join("vd", "fake.qcow2"),
+                          TRUE_SIGS["QCOW_MAGIC"][1] + b"\x00\x00\x00\x03")
+        qcow_other = _fake(os.path.join("vd", "other.qcow2"),
+                           TRUE_SIGS["QCOW_MAGIC"][1] + b"\x00\x00\x00\x09")
+        virtual_fakes = (vhd_fixed_fake, vhd_dynamic_fake, vhdx_fake, vmdk_desc_fake,
+                         vmdk_sparse_fake, vmdk_cowd_fake, qcow_fake)
+        virtual_kinds = ["VHD", "VHD", "VHDX", "VMDK", "VMDK", "VMDK", "QCOW"]
+
+        class _Chain:
+            """A stand-in for a reader's image read over a parent."""
+
+            def __init__(self, fmt, paths, parent=None):
+                self.format, self.paths, self.parent = fmt, paths, parent
+
+        def _kinds_without_reader(paths):
+            saved = ewfprobe
+            try:
+                globals()["ewfprobe"] = None
+                return [acquisition_format(q) for q in paths]
+            finally:
+                globals()["ewfprobe"] = saved
 
         class _InnerLogical:
             """A stand-in for the reader whose AD-encrypted set decrypts to an L01 or
@@ -13428,10 +13560,106 @@ def self_test():
                  == ["SPARSEBUNDLE", "DMG_ENCRYPTED", None]),
                 ("without the vendored reader a sparse bundle is refused, saying what "
                  "is missing",
-                 "ewfprobe" in (_refusal(bundle_fake, None) or ""))):
+                 "ewfprobe" in (_refusal(bundle_fake, None) or "")),
+                ("a VHD (by the footer at its end or the copy at its start), a VHDX, a "
+                 "VMDK descriptor or sparse extent and a QCOW are each named by their "
+                 "own bytes, with and without the reader, and a QCOW of an unknown "
+                 "version is not one",
+                 [acquisition_format(q) for q in virtual_fakes + (qcow_other,)]
+                 == virtual_kinds + [None]
+                 and _kinds_without_reader(virtual_fakes + (qcow_other,))
+                 == virtual_kinds + [None]),
+                ("a virtual disk is never opened as raw bytes",
+                 not any(_opened_as_raw(q) for q in virtual_fakes)),
+                ("without the vendored reader a virtual disk is refused, saying what is "
+                 "missing",
+                 all("ewfprobe" in (_refusal(q, None) or "") for q in virtual_fakes)),
+                ("with the reader present a damaged virtual disk is refused by it, not "
+                 "read",
+                 saved_reader is None or all(_ewf_refused_by_reader(q)
+                                             for q in virtual_fakes)),
+                ("a disk read over parents names each, nearest first, and records "
+                 "every parent file with its size",
+                 describe_acquisition(_Chain("QCOW", [vhd_dynamic_fake], _Chain(
+                     "QCOW", [qcow_fake], _Chain("QCOW", [vhdx_fake, vmdk_desc_fake]))))
+                 == ("a QCOW virtual disk of one file, over its parents fake.qcow2, "
+                     "fake.vhdx (nearest first)")
+                 and describe_acquisition(_Chain("VHD", [vhd_dynamic_fake],
+                                                 _Chain("VHD", [vhdx_fake])))
+                 == "a VHD virtual disk of one file, over its parent fake.vhdx"
+                 and image_parents(_Chain("VMDK", [vmdk_desc_fake], _Chain(
+                     "VMDK", [vmdk_sparse_fake, vmdk_cowd_fake])))
+                 == [{"name": "fake-s001.vmdk", "bytes": 4100},
+                     {"name": "fake-cowd.vmdk", "bytes": 4100}]
+                 and image_parents(_Chain("VHD", [vhd_dynamic_fake])) == [])):
             if not cond:
                 ok = False
             print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+        # A fixed and a dynamic VHD built by hand around a known 1 MiB disk, so the
+        # route to the reader is tested on bytes it did not write. The layout is
+        # written out again here from Microsoft's Virtual Hard Disk Image Format
+        # Specification rather than taken from the reader: a big-endian 512-byte
+        # footer (a dynamic disk's copy of it first in the file), a 1,024-byte
+        # dynamic header, a table of 32-bit block sector offsets, and a block of a
+        # sector bitmap (most significant bit first) and its data. Each checksum is
+        # the one's complement of the sum of the structure's bytes.
+        if saved_reader is None:
+            print("  [SKIP] a hand-built VHD reads as its disk (needs the vendored ewfprobe)")
+        else:
+            vd_disk = bytearray(1 << 20)
+            vd_disk[0:512] = bytes(range(256)) * 2
+            vd_disk[700 * 512:701 * 512] = b"qnxprobe" * 64
+
+            def _vhd_sum(data):
+                return (~sum(data)) & 0xFFFFFFFF
+
+            def _vhd_footer(disk_type, data_offset):
+                f = bytearray(512)
+                struct.pack_into(">8sIIQIIII", f, 0, b"conectix", 2, 0x00010000,
+                                 data_offset, 0, 0, 0, 0)
+                struct.pack_into(">QQHBBI", f, 40, len(vd_disk), len(vd_disk), 30, 4, 17,
+                                 disk_type)
+                f[68:84] = bytes(range(16))
+                struct.pack_into(">I", f, 64, _vhd_sum(f))
+                return bytes(f)
+
+            vd_fixed = os.path.join(d, "vd", "built-fixed.vhd")
+            with open(vd_fixed, "wb") as fh:
+                fh.write(bytes(vd_disk) + _vhd_footer(2, 0xFFFFFFFFFFFFFFFF))
+            block = 2 << 20
+            footer = _vhd_footer(3, 512)
+            header = bytearray(1024)
+            struct.pack_into(">8sQQIII", header, 0, b"cxsparse", 0xFFFFFFFFFFFFFFFF, 1536,
+                             0x00010000, 1, block)
+            struct.pack_into(">I", header, 36, _vhd_sum(header))
+            bat = struct.pack(">I", 2048 // 512).ljust(512, b"\xff")
+            bitmap = bytearray(512)                       # 4,096 sectors in a block
+            for sector in (0, 700):                       # the two sectors written
+                bitmap[sector >> 3] |= 0x80 >> (sector & 7)
+            data = bytes(vd_disk).ljust(block, b"\x00")
+            vd_dynamic = os.path.join(d, "vd", "built-dynamic.vhd")
+            with open(vd_dynamic, "wb") as fh:
+                fh.write(footer + bytes(header) + bat + bytes(bitmap) + data + footer)
+
+            def _reads_as_disk(path):
+                try:
+                    with open_image(path) as handle:
+                        handle.seek(0)
+                        return (image_size(handle) == len(vd_disk)
+                                and handle.read(len(vd_disk)) == bytes(vd_disk))
+                except Exception:           # pylint: disable=broad-exception-caught
+                    return False
+
+            for label, cond in (
+                    ("a hand-built fixed and dynamic VHD are named VHD and read through "
+                     "the reader as the 1 MiB disk they hold, not as their files' bytes",
+                     [acquisition_format(q) for q in (vd_fixed, vd_dynamic)]
+                     == ["VHD", "VHD"]
+                     and _reads_as_disk(vd_fixed) and _reads_as_disk(vd_dynamic)),):
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
         # An encrypted image built by hand (encrcdsa version 2, AES-128, the keys
         # wrapped with AES-192 as current hdiutil writes them), so opening with and
