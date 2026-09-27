@@ -111,6 +111,8 @@ jobs:
           # the executable carries the cipher package, so the encrypted image leg runs
           assert "[PASS] an encrypted image opens with its password" in r.stdout, "no cipher"
           assert "[PASS] an AD-encrypted raw set opens from its second file" in r.stdout, "no AD leg"
+          # and the vendored reader reads a virtual disk from inside the executable
+          assert "[PASS] a hand-built fixed and dynamic VHD are named VHD" in r.stdout, "no VHD leg"
 
           r = subprocess.run([cli, "--list", "fixtures/positive_le.img"], capture_output=True, text=True)
           print(r.stdout[-400:]); assert r.returncode == 0 and "VERDICT: QNX6 filesystem present." in r.stdout

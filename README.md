@@ -231,7 +231,9 @@ The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
 including `short` (files whose blocks reach past the end of the image) and, on a
 volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
-first segment and `image_segments` lists every segment joined, with its byte count.
+first segment and `image_segments` lists every segment joined, with its byte count;
+on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
+first, with theirs.
 For a bare image with no vendor export alongside it, that file is the record
 tying every extracted path back to a place on the disk, checkable against
 `mmls` or `fdisk` without trusting the directory names.
@@ -1124,6 +1126,10 @@ by its own first bytes rather than its name:
 | any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
 | an E01, SMART or raw (dd) set FTK Imager encrypted with AD encryption, since 1.42 | the first file (`.E01`, `.s01`), or any `.001`, `.002`, ... of a raw set, with its password |
 | AFF4 (standard v1.0 or Evimetry's pre-standard layout), since 1.44 | the `.aff4`, or any file of one striped across several, with the others beside it |
+| VHD, fixed, dynamic or differencing, since 1.46 | the `.vhd`; a differencing one with its parent beside it or where it names |
+| VHDX, fixed, dynamic or differencing, since 1.46 | the `.vhdx`, likewise |
+| VMDK, since 1.46 | the descriptor `.vmdk`, or any of its sparse extents, with its other files beside it |
+| QCOW, versions 1, 2 and 3, since 1.46 | the `.qcow` or `.qcow2`; an overlay with its backing file beside it |
 
 A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
 has no trailer: it is the disk's bytes as they are, and has always been read as a raw
@@ -1162,6 +1168,21 @@ back `not recognised`, and only the three that hold the disk's bytes in order (U
 Before 1.38 only the E01 signature was recognised. An Ex01, AFF, AFD or L01 was
 read as raw bytes, and on every test acquisition of each that found no filesystem
 at all: the report said `whole image ... not recognised`.
+
+Since 1.46 the disks virtual machines keep are read the same way: Microsoft's VHD and
+VHDX, VMware's VMDK and QEMU's QCOW, each recognised by its own bytes (a VHD by the footer at its end
+or the copy of it at its start). A differencing VHD or VHDX, a VMDK delta and a QCOW
+overlay are read through the disks under them, which the reader checks against the id
+the child records where the format keeps one; the report names each parent, and
+`volumes.json` lists every parent file with its byte count as `image_parents`, nearest
+first. A VMDK flat extent holds the disk's bytes as they are and is still read as raw.
+An encrypted QCOW is refused by the reader. Before 1.46 a fixed VHD was read as a raw
+image with its 512-byte footer at the end (on the one qemu-img 10.2.1 wrote, that still
+found its volume), and the dynamic VHD, VHDX, VMDK and QCOW2 disks qemu-img 10.2.1
+wrote, and a dynamic VHD Windows 11 wrote, each came back `whole image ... not
+recognised`. Extracting through a differencing VHD Windows 11 wrote now gives the same
+22 files, byte for byte, as extracting from the disk Windows presented, read through
+`\\.\PhysicalDriveN`.
 
 The segments of a multi-segment acquisition, and the files of an AFD, are joined by
 the reader from the format's own records, not from the file names, and a set
@@ -1488,7 +1509,8 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
   is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
-  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle` is read
+  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`, and
+  (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
   (since 1.45) AD1 logical evidence is refused, since it holds no disk. Other evidence containers
   are not decoded; such a file is read as plain raw bytes, so export the raw image
