@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.44"
+QNXPROBE_VERSION = "1.45"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -167,6 +167,7 @@ EWF2_SIGNATURE = b"EVF2\x0d\x0a\x81\x00"        # EWF2-Ex01
 AFF_SIGNATURE  = b"AFF10\x0d\x0a\x00"           # AFF, and every file of an AFD
 L01_SIGNATURE  = b"LVF\x09\x0d\x0a\xff\x00"     # EnCase logical evidence (L01)
 LX01_SIGNATURE = b"LEF2\x0d\x0a\x81\x00"        # EWF2 logical evidence (Lx01)
+AD1_SIGNATURE  = b"ADSEGMENTEDFILE\x00"        # FTK Imager logical evidence, every file
 # Apple disk images. A UDIF image (.dmg) ends in a 512-byte trailer beginning
 # "koly"; an uncompressed read-write image has none and is plain disk bytes, read
 # as raw. A .dmgpart segment of a split .dmg ends in one too, and the reader names
@@ -195,8 +196,8 @@ _ACQUISITION_NAMES = {
     "SPARSEIMAGE": "an Apple sparse image (.sparseimage)",
     "SPARSEBUNDLE": "an Apple sparse bundle (a .sparsebundle folder)",
     "DMG_ENCRYPTED": "an encrypted Apple disk image (.dmg, .sparseimage or .sparsebundle)",
-    "AD_ENCRYPTED": "an acquisition FTK Imager encrypted with AD encryption (.E01, .s01 "
-                    "or .001)",
+    "AD_ENCRYPTED": "an acquisition FTK Imager encrypted with AD encryption (.E01, .s01, "
+                    ".001 or .ad1)",
 }
 
 
@@ -276,6 +277,22 @@ def _numbered_first(path):
     return None
 
 
+def _ad1_first(path):
+    """The .ad1 of the AD1 set path would belong to (.ad1, .ad2, ...), when it is on
+    disk, else None."""
+    folder, name = os.path.split(os.path.abspath(path))
+    stem, dot, suffix = name.rpartition(".")
+    number = suffix[2:]
+    if not dot or suffix[:2].lower() != "ad" or not (number.isascii() and number.isdigit()):
+        return None
+    try:
+        present = {entry.lower(): entry for entry in os.listdir(folder)}
+    except OSError:
+        return None
+    first = present.get(f"{stem}.ad1".lower())
+    return os.path.join(folder, first) if first else None
+
+
 def needs_password(path):
     """True when path is an image that opens only with its password: an encrypted
     Apple disk image, or an acquisition FTK Imager encrypted with AD encryption."""
@@ -284,7 +301,7 @@ def needs_password(path):
 
 def acquisition_format(path):
     """What acquisition container path is: "EWF", "EWF2", "AFF", "AFD", "AFF4",
-    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "DMG_ENCRYPTED" or
+    "UDIF", "SPARSEIMAGE", "SPARSEBUNDLE", "L01", "Lx01", "AD1", "DMG_ENCRYPTED" or
     "AD_ENCRYPTED", or None for anything else, which is read as a raw image. An
     AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
     Standard (5.4) has its writer put in the ZIP comment or in a first member
@@ -293,8 +310,9 @@ def acquisition_format(path):
     An AFD is a folder whose name ends .afd holding AFF files, the form AFFLIB
     writes when an image is split; it is recognised from the folder or from any
     AFF file in it, because one file holds only some of the image. A sparse bundle
-    is a folder too, recognised by its Info.plist whatever it is called. L01 and
-    Lx01 are logical evidence: they hold copies of files, not a disk.
+    is a folder too, recognised by its Info.plist whatever it is called. L01, Lx01
+    and FTK Imager's AD1 are logical evidence: they hold copies of files, not a
+    disk. An AD-encrypted AD1 set is recognised from any of its files by its .ad1.
     """
     if os.path.isdir(path):
         bundle = _sparsebundle_kind(path)
@@ -321,6 +339,8 @@ def acquisition_format(path):
         return "L01"
     if head == LX01_SIGNATURE:
         return "Lx01"
+    if head == AD1_SIGNATURE[:8] and _first_bytes(path, 16) == AD1_SIGNATURE:
+        return "AD1"
     if head == DMG_ENCRYPTED_SIGNATURE:
         return "DMG_ENCRYPTED"
     if head == ADCRYPT_SIGNATURE:
@@ -338,7 +358,7 @@ def acquisition_format(path):
                     return "UDIF"
     except OSError:
         return None
-    first = _numbered_first(path)
+    first = _numbered_first(path) or _ad1_first(path)
     if first and _first_bytes(first) == ADCRYPT_SIGNATURE:
         return "AD_ENCRYPTED"
     return None
@@ -551,16 +571,10 @@ def open_image(path, segments=None, password=None):
     image, ImagePasswordError is raised. Other images ignore it."""
     kind = acquisition_format(path)
     name = os.path.basename(os.path.normpath(path))
-    if kind in ("L01", "Lx01"):
+    if kind in ("L01", "Lx01", "AD1"):
         # Read as raw bytes this would hold no partition table and no
         # filesystem, and the run would report an empty disk.
-        reader = ("ewfprobe lists and exports them (ewfprobe.py files, "
-                  "ewfprobe.py export --entry)" if kind == "L01" else
-                  "the vendored ewfprobe does not read Lx01")
-        raise ImageUnreadable(
-            f"{name} is EnCase logical evidence ({kind}): it holds copies of "
-            f"files, not a disk, so there is no partition table or filesystem "
-            f"in it to read. For its files, {reader}.")
+        raise ImageUnreadable(_logical_refusal(name, kind))
     if kind:
         if ewfprobe is None:
             raise ImageUnreadable(
@@ -576,15 +590,33 @@ def open_image(path, segments=None, password=None):
         # ewfprobe decrypts it, given the password; without the optional cipher
         # package it refuses the image, naming the package
         try:
-            return ewfprobe.open_ewf(path, password=password)
+            image = ewfprobe.open_ewf(path, password=password)
         except ewfprobe.EwfPasswordError as exc:
             raise ImagePasswordError(
                 str(exc), isinstance(exc, ewfprobe.EwfWrongPasswordError)) from None
+        # What an AD-encrypted set decrypts to can be logical evidence as well
+        inner = {"EWF-L01": "L01", "AD1": "AD1"}.get(getattr(image, "format", None))
+        if inner:
+            image.close()
+            raise ImageUnreadable(_logical_refusal(name, inner, encrypted=True))
+        return image
     if segments is None:
         segments = split_segments(path)
     if segments:
         return SegmentedImage(segments)
     return open(path, "rb")
+
+
+def _logical_refusal(name, kind, encrypted=False):
+    """Why logical evidence is not read as a disk, and what reads its files."""
+    maker = "FTK Imager" if kind == "AD1" else "EnCase"
+    reader = ("the vendored ewfprobe does not read Lx01" if kind == "Lx01" else
+              "ewfprobe lists and exports them (ewfprobe.py files, "
+              "ewfprobe.py export --entry)")
+    locked = ", encrypted with AD encryption" if encrypted else ""
+    return (f"{name} is {maker} logical evidence ({kind}){locked}: it holds copies of "
+            f"files, not a disk, so there is no partition table or filesystem in it "
+            f"to read. For its files, {reader}.")
 
 
 # The container ewfprobe reports, by its format label, as a run describes it.
@@ -13217,6 +13249,7 @@ def self_test():
             "SPARSEIMAGE_SIGNATURE": (SPARSEIMAGE_SIGNATURE, b"sprs"),
             "DMG_ENCRYPTED_SIGNATURE": (DMG_ENCRYPTED_SIGNATURE, b"encrcdsa"),
             "ADCRYPT_SIGNATURE": (ADCRYPT_SIGNATURE, b"ADCRYPT\x00"),
+            "AD1_SIGNATURE": (AD1_SIGNATURE, b"ADSEGMENTEDFILE\x00"),
             "SPARSEBUNDLE_TYPE": (SPARSEBUNDLE_TYPE, "com.apple.diskimage.sparsebundle"),
         }
         for const, (have, want) in TRUE_SIGS.items():
@@ -13252,6 +13285,42 @@ def self_test():
         ad_first = _fake("ad_fake.0001", TRUE_SIGS["ADCRYPT_SIGNATURE"][1])
         ad_second = _fake("ad_fake.0002", b"\x5a" * 8)
         plain_second = _fake("plain_fake.0002", b"\x00" * 8)
+        ad1_fake = _fake(os.path.join("ad1", "fake.ad1"), TRUE_SIGS["AD1_SIGNATURE"][1])
+        ad1_second = _fake(os.path.join("ad1", "fake.ad2"), TRUE_SIGS["AD1_SIGNATURE"][1])
+        ad1_enc = _fake(os.path.join("ad1enc", "enc.AD1"), TRUE_SIGS["ADCRYPT_SIGNATURE"][1])
+        ad1_enc_second = _fake(os.path.join("ad1enc", "enc.ad2"), b"\x5a" * 16)
+        ad1_lone = _fake(os.path.join("ad1lone", "lone.ad2"), b"\x5a" * 16)
+
+        class _InnerLogical:
+            """A stand-in for the reader whose AD-encrypted set decrypts to an L01 or
+            an AD1, to reach open_image's own check after it is opened."""
+            EwfPasswordError = EwfWrongPasswordError = Exception
+
+            def __init__(self, fmt):
+                self.fmt, self.closed = fmt, False
+
+            def open_ewf(self, path, password=None):
+                outer = self
+
+                class _Image:
+                    format = outer.fmt
+
+                    def close(self):
+                        outer.closed = True
+                return _Image()
+
+        def _inner_refusal(fmt):
+            reader = _InnerLogical(fmt)
+            saved = ewfprobe
+            try:
+                globals()["ewfprobe"] = reader
+                try:
+                    open_image(ad1_enc, password="x")
+                except ImageUnreadable as exc:
+                    return str(exc) if reader.closed else None
+                return None
+            finally:
+                globals()["ewfprobe"] = saved
         _fake("plain_fake.0001", b"\x00" * 8)
 
         def _bundle(name, token=b"", kind=None):
@@ -13339,6 +13408,20 @@ def self_test():
                 ("without the vendored reader an AD-encrypted set is refused, saying "
                  "what is missing",
                  "ewfprobe" in (_refusal(ad_second, None) or "")),
+                ("an AD1 is named from any of its files, an AD-encrypted one by its .ad1 "
+                 "whatever its case, and a lone .ad2 is not one",
+                 [acquisition_format(q) for q in (ad1_fake, ad1_second, ad1_enc,
+                                                  ad1_enc_second, ad1_lone)]
+                 == ["AD1", "AD1", "AD_ENCRYPTED", "AD_ENCRYPTED", None]
+                 and needs_password(ad1_enc_second) and not needs_password(ad1_second)),
+                ("an AD1 is refused as FTK Imager logical evidence, with or without "
+                 "the reader",
+                 all("FTK Imager logical evidence" in (_refusal(q, r) or "")
+                     for q in (ad1_fake, ad1_second) for r in (None, saved_reader))),
+                ("an AD-encrypted set that decrypts to an L01 or an AD1 is closed and "
+                 "refused as logical evidence",
+                 all("logical evidence (" + k + "), encrypted" in (_inner_refusal(f) or "")
+                     for f, k in (("EWF-L01", "L01"), ("AD1", "AD1")))),
                 ("a sparse bundle is named by its Info.plist, an encrypted one by its "
                  "token, and a folder of another type is not one",
                  [acquisition_format(q) for q in (bundle_fake, bundle_enc, bundle_other)]

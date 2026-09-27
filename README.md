@@ -1167,10 +1167,12 @@ The segments of a multi-segment acquisition, and the files of an AFD, are joined
 the reader from the format's own records, not from the file names, and a set
 missing a segment or a file is refused rather than read short.
 
-EnCase logical evidence (`.L01`, `.Lx01`) holds copies of files, not a disk, so it
-has no partition table or filesystem for this tool to read. It is refused with a
-message saying so, and never read as raw bytes. `ewfprobe.py` lists and exports the
-files of an L01 (`python3 ewfprobe.py files evidence.L01`).
+Logical evidence, EnCase's (`.L01`, `.Lx01`) and FTK Imager's (`.ad1`, `.ad2`, ...),
+holds copies of files, not a disk, so it has no partition table or filesystem for this
+tool to read. It is refused with a message saying so, and never read as raw bytes,
+including an AD-encrypted set that turns out, once opened with its password, to hold an
+L01 or an AD1. `ewfprobe.py` lists and exports the files of an L01 or an AD1
+(`python3 ewfprobe.py files evidence.ad1`).
 
 This is `ewfprobe.py`, vendored from
 [abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
@@ -1487,10 +1489,10 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
   is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
   `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle` is read
-  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
-  Lx01 logical evidence is refused, since it holds no disk. AD1 and the other
-  evidence containers are not decoded; such a file is read as plain raw bytes, so
-  export the raw image from the imaging tool first. A segment set is joined only when it is whole from its first
+  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
+  (since 1.45) AD1 logical evidence is refused, since it holds no disk. Other evidence containers
+  are not decoded; such a file is read as plain raw bytes, so export the raw image
+  from the imaging tool first. A segment set is joined only when it is whole from its first
   segment (see "Split images" above). A lone first segment is read as the file it is,
   and since 1.12 a run on it says `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names
   the partitions that reach past the end, marks each affected volume `INCOMPLETE` in
