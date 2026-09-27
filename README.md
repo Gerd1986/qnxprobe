@@ -1119,6 +1119,8 @@ by its own first bytes rather than its name:
 | EWF2 (Ex01) | the `.Ex01` |
 | AFF | the `.aff` |
 | AFD, the folder of AFF files AFFLIB writes when an image is split | the `.afd` folder, or any `.aff` in it |
+| AFM, AFF metadata beside the disk as raw files, since 1.47 | the `.afm`, with its `.000`, `.001`, ... beside it |
+| an AFF, AFD or AFM AFFLIB encrypted, since 1.47 | the same, with its passphrase, or with `--private-key` when it is sealed to a certificate |
 | Apple disk image (UDIF), since 1.39 | the `.dmg` |
 | Apple disk image split by `hdiutil segment`, since 1.40 | the `.dmg`, with its `.dmgpart` files beside it |
 | Apple sparse image, since 1.39 | the `.sparseimage` |
@@ -1168,6 +1170,17 @@ back `not recognised`, and only the three that hold the disk's bytes in order (U
 Before 1.38 only the E01 signature was recognised. An Ex01, AFF, AFD or L01 was
 read as raw bytes, and on every test acquisition of each that found no filesystem
 at all: the report said `whole image ... not recognised`.
+
+Since 1.47 an AFF AFFLIB encrypted opens with its passphrase, given the way any
+password is, or, when it is sealed to a certificate, with that certificate's RSA
+private key (`--private-key FILE`, repeatable; the window asks for the key file).
+`needs_password` and `needs_private_key` say which one an image needs, and
+`ImagePasswordError.needs` names it when neither was given. An AFF whose header was
+overwritten by a segment, as AFFLIB 3.7.22's `affcrypto -e` leaves a file it
+encrypts in place (AFFLIB cannot open it afterwards), is recognised by that segment
+and read from its segments. An `.afm` is read from the raw files beside it; before
+1.47 it was read as an AFF with every page missing, so the whole disk came back as the
+bad-sector marker and nothing on it was found.
 
 Since 1.46 the disks virtual machines keep are read the same way: Microsoft's VHD and
 VHDX, VMware's VMDK and QEMU's QCOW, each recognised by its own bytes (a VHD by the footer at its end
@@ -1229,9 +1242,10 @@ reported as not recognised, with its first bytes shown.
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
-| `--password-file FILE` | For an encrypted image (an Apple disk image or an AD-encrypted FTK Imager acquisition) or a BitLocker volume: a password or recovery password, the first line of FILE. Repeatable |
+| `--password-file FILE` | For an encrypted image (an Apple disk image, an AD-encrypted FTK Imager acquisition or an encrypted AFF) or a BitLocker volume: a password or recovery password, the first line of FILE. Repeatable |
 | `--password-env NAME` | For an encrypted image or a BitLocker volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
 | `--bitlocker-key FILE` | A BitLocker startup key (a `.BEK` file), tried against every BitLocker volume. Repeatable |
+| `--private-key FILE` | For an AFF sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
@@ -1509,8 +1523,9 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
   is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
-  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`, and
-  (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, is read
+  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`,
+  (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
+  encrypted AFF, is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
   (since 1.45) AD1 logical evidence is refused, since it holds no disk. Other evidence containers
   are not decoded; such a file is read as plain raw bytes, so export the raw image

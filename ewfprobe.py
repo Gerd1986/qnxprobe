@@ -58,7 +58,7 @@ disks Windows, VMware's tools and qemu-img wrote; no code from any of them is co
 
 Scope. This reads EWF-E01, the format EnCase 6 and 7 and FTK Imager write and
 by far the most common one in the field, EWF-S01, the variant ASR Data's SMART
-writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD, and
+writes, EWF2-Ex01, which EnCase 7 and later write, AFF, including AFD and AFM, and
 EWF-L01 logical evidence, FTK Imager's AD1 (version 4), and UDIF, sparse image and
 sparse bundle Apple disk images, encrypted with a password or not, AD-encrypted E01,
 SMART, raw and AD1 sets, AFF4 containers, standard and pre-standard, striped or
@@ -67,9 +67,10 @@ than version 4, an AD-encrypted image protected by a certificate, an Apple disk
 image unlocked by a certificate or a keybag rather than a password, or one in the
 older version 1 encrypted format (cdsaencr), an encrypted QCOW, a VMDK SESPARSE
 extent, a VHD split into .v01 files, encrypted Ex01 images (the encryption
-is not publicly documented), Ex01 images compressed with bzip2 (no sample exists to
-validate against), encrypted AFF, or AFM (AFF metadata beside split raw files), and
-it never writes.
+is not publicly documented), or Ex01 images compressed with bzip2 (no sample exists to
+validate against), and it never writes.
+An encrypted AFF opens with its passphrase or with the private key of a certificate
+it is sealed to.
 
 An image whose content is encrypted at rest, by BitLocker or FileVault or an
 encrypted APFS volume, reads back as the ciphertext that was acquired: the
@@ -106,7 +107,7 @@ try:
 except ImportError:
     lzma = None
 
-__version__ = "0.9.0"
+__version__ = "0.10.0"
 
 # ---------------------------------------------------------------- constants
 
@@ -211,11 +212,22 @@ AF_PAGE_COMP_ALG_LZMA = 0x0020
 AF_PAGE_COMP_ALG_ZERO = 0x0030                   # data is a 4-byte count of NULs
 AF_AES256_SUFFIX = "/aes256"
 AF_SIG256_SUFFIX = "/sha256"
+# An encrypted AFF (lib/crypto.cpp and af_update_segf in lib/afflib.cpp): a segment
+# is stored as <name>/aes256 (all but a few AFFLIB leaves clear), AES-256-CBC with an
+# IV of the segment's own name (at most 15 bytes of it, then zeros). The data is
+# padded to whole blocks and the stored length is the padded length plus the
+# original length's remainder mod 16, which is how a reader recovers it. The one
+# AES-256 key is kept in affkey_aes256, encrypted (ECB, two blocks) with the SHA-256
+# of the passphrase beside an encrypted block of zeros that proves the passphrase,
+# and, for each certificate it is sealed to, in affkey_evp<N>: an OpenSSL envelope
+# (RSA PKCS#1 v1.5 for a random session key, AES-256-CBC for the file key).
+_AF_AFFKEY = "affkey_aes256"
+_AF_AFFKEY_EVP = re.compile(r"affkey_evp(\d+)")
 _AF_PAGE_NAME = re.compile(r"(?:page|seg)(\d+)")
 _AF_PAGE_HASH_NAME = re.compile(r"(?:page|seg)\d+_(?:md5|sha1|sha256)")
 _AF_STRUCTURAL = {"pagesize", "segsize", "imagesize", "sectorsize", "badflag",
                   "badsectors", "blanksectors", "md5", "sha1", "sha256", "image_gid",
-                  "devicesectors", "aff_file_type"}
+                  "devicesectors", "aff_file_type", _AF_AFFKEY}
 # AFF segments with the same meaning as an EWF header value are reported under that
 # value's name; every other text segment keeps the name it is stored under.
 _AFF_FIELDS = {
@@ -231,6 +243,14 @@ _AFF_MAX_SMALL = 1 << 16                         # non-page segments read into m
 # segment from the first file that holds it, and names the files it writes
 # file_000.aff, file_001.aff and on, numbered by how many it already has.
 FORMAT_AFD = "AFD"
+# AFM: an AFF file holding only the metadata (its aff_file_type is "AFM") beside the
+# disk kept as plain raw files, named after it with the extension it records
+# (raw_image_file_extension, "000" by default) and counted up the way split raw files
+# are: 000 to 999, then A00 to ZZZ in base 36 (lib/vnode_afm.cpp and
+# split_raw_increment_fname in lib/vnode_split_raw.cpp). AFFLIB joins the files while
+# the next one exists, every one but the last the size of the first, and requires the
+# total to be the image size the metadata records.
+FORMAT_AFM = "AFM"
 # AFF4: see the AFF4 section above EwfImage.
 FORMAT_AFF4 = "AFF4"
 _AFD_MEMBER_NAME = re.compile(r"file_(\d+)\.aff", re.IGNORECASE)
@@ -404,6 +424,15 @@ except ImportError:
         from Cryptodome.Cipher import AES as _AES, DES3 as _DES3    # pycryptodomex
     except ImportError:
         _AES = _DES3 = None
+try:                                            # optional, for AFF sealed to a certificate
+    from Crypto.PublicKey import RSA as _RSA
+    from Crypto.Cipher import PKCS1_v1_5 as _PKCS1
+except ImportError:
+    try:
+        from Cryptodome.PublicKey import RSA as _RSA
+        from Cryptodome.Cipher import PKCS1_v1_5 as _PKCS1
+    except ImportError:
+        _RSA = _PKCS1 = None
 
 # How many decompressed chunks and open segment handles to keep. A chunk is
 # normally 32 KiB, so the cache is a couple of megabytes at the default.
@@ -455,7 +484,12 @@ class EwfPasswordError(EwfFormatError):
 
 
 class EwfPasswordRequiredError(EwfPasswordError):
-    """The image is encrypted and no password was given."""
+    """The image is encrypted and no password was given. ``needs`` is "password", or
+    "private key" for an AFF that is sealed only to a certificate."""
+
+    def __init__(self, message, needs="password"):
+        super().__init__(message)
+        self.needs = needs
 
 
 class EwfWrongPasswordError(EwfPasswordError):
@@ -503,7 +537,10 @@ def _family(ext):
 
 def is_image(path) -> bool:
     """True when ``path`` is a disk image ewfprobe reads: a file beginning with the
-    EWF, EWF2 or AFF signature, an AFF4 container, an AFD directory holding AFF files,
+    EWF, EWF2 or AFF signature (or an AFF whose header an in-place encryption
+    overwrote; an encrypted AFF counts, and opening one needs its passphrase or key,
+    which EwfPasswordRequiredError's ``needs`` names), an AFF4 container, an AFD
+    directory holding AFF files,
     an Apple UDIF (.dmg), sparse image (.sparseimage) or sparse bundle
     (.sparsebundle), or a virtual disk virtual_disk_kind names (VHD, VHDX, VMDK,
     QCOW). An L01 holds files rather than a disk; is_logical_evidence answers for it. An
@@ -525,7 +562,7 @@ def is_image(path) -> bool:
                 return True
     except OSError:
         return False
-    return (is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
+    return (_is_aff(path) or is_aff4(path) or apple_image_kind(path) in (FORMAT_UDIF, FORMAT_SPARSEIMAGE)
             or virtual_disk_kind(path) is not None)
 
 
@@ -1111,12 +1148,126 @@ def is_logical_evidence(path) -> bool:
     return head[:8] == LVF_SIGNATURE or head == AD1_SIGNATURE
 
 
+def _aff_start(fh, size):
+    """Where an AFF file's first segment begins: 8, after the header; 0 when a segment
+    stands where the header belongs and its tail is where its lengths put it, which is
+    how AFFLIB 3.7.22's affcrypto -e leaves a file it encrypts in place (it rewrote the
+    first segment over the header, on macOS and Linux alike, and AFFLIB cannot open
+    the result); else None."""
+    fh.seek(0)
+    head = fh.read(8)
+    if head == AF_HEADER:
+        return 8
+    if head[:4] != b"AFF\x00" or size < _AF_SEGHEAD.size + _AF_SEGTAIL.size:
+        return None
+    fh.seek(0)
+    _magic, name_len, data_len, _arg = _AF_SEGHEAD.unpack(fh.read(_AF_SEGHEAD.size))
+    tail = _AF_SEGHEAD.size + name_len + data_len
+    if name_len > 1024 or tail + _AF_SEGTAIL.size > size:
+        return None
+    fh.seek(tail)
+    tail_magic, seg_len = _AF_SEGTAIL.unpack(fh.read(_AF_SEGTAIL.size))
+    return 0 if tail_magic == b"ATT\x00" and seg_len == tail + _AF_SEGTAIL.size else None
+
+
 def _is_aff(path):
     try:
         with open(path, "rb") as fh:
-            return fh.read(8) == AF_HEADER
+            return _aff_start(fh, os.path.getsize(path)) is not None
     except OSError:
         return False
+
+
+def _aff_decrypt(cipher_key, name, data):
+    """An encrypted AFF segment's data (af_aes_decrypt in lib/afflib.cpp), ``name``
+    being the segment's name without /aes256."""
+    extra = len(data) % 16
+    if extra and len(data) < 16:
+        raise EwfFormatError(f"the encrypted segment {name} holds {len(data)} bytes, "
+                             f"fewer than one block")
+    body = data[:len(data) - extra]
+    iv = name.encode("utf-8")[:15].ljust(16, b"\x00")
+    plain = _AES.new(cipher_key, _AES.MODE_CBC, iv).decrypt(body) if body else b""
+    return plain[:len(plain) - (16 - extra) % 16]
+
+
+def _aff_key_from_passphrase(label, stored, password):
+    """The file key from affkey_aes256 and a passphrase, or None when the passphrase
+    does not open it (af_get_aes_key_from_passphrase in lib/crypto.cpp)."""
+    if len(stored) not in (52, 56):
+        raise EwfFormatError(f"{label}: its key segment holds {len(stored)} bytes, not the "
+                             f"52 AFFLIB writes (or 56, from builds that padded it)")
+    if struct.unpack_from(">I", stored)[0] != 1:
+        raise EwfFormatError(f"{label}: its key segment is version "
+                             f"{struct.unpack_from('>I', stored)[0]}, not 1")
+    secret = password.encode("utf-8") if isinstance(password, str) else bytes(password)
+    ecb = _AES.new(hashlib.sha256(secret).digest(), _AES.MODE_ECB)
+    if any(ecb.decrypt(stored[36:52])):
+        return None
+    return ecb.decrypt(stored[4:36])
+
+
+def _aff_key_from_seal(stored, rsa):
+    """The file key from one affkey_evp segment and an RSA private key, or None when
+    the key does not open it (af_get_affkey_using_keyfile in lib/crypto.cpp)."""
+    if len(stored) < 28:
+        return None
+    version, ek_size, sealed_size = struct.unpack_from(">III", stored)
+    if version != 1 or 28 + ek_size + sealed_size != len(stored) or sealed_size % 16:
+        return None
+    iv, ek = stored[12:28], stored[28:28 + ek_size]
+    try:
+        session = _PKCS1.new(rsa).decrypt(ek, None)
+    except (ValueError, TypeError):
+        return None
+    if session is None or len(session) != 32:
+        return None
+    plain = _AES.new(session, _AES.MODE_CBC, iv).decrypt(stored[28 + ek_size:])
+    pad = plain[-1] if plain else 0
+    if not 1 <= pad <= 16 or plain[-pad:] != bytes([pad]) * pad or len(plain) - pad < 32:
+        return None
+    return plain[:32]
+
+
+def _private_key(given):
+    """An RSA private key from a PEM or DER file, or its bytes."""
+    if _RSA is None:
+        raise EwfFormatError("reading a private key needs the optional pycryptodome "
+                             "package (pip install pycryptodome), which this Python does "
+                             "not have")
+    if isinstance(given, (bytes, bytearray)):
+        data = bytes(given)
+    else:
+        try:
+            with open(given, "rb") as fh:
+                data = fh.read(1 << 20)
+        except OSError as exc:
+            raise EwfFormatError(f"the private key file could not be read: "
+                                 f"{exc.strerror or exc}") from None
+    try:
+        return _RSA.import_key(data)
+    except (ValueError, IndexError, TypeError) as exc:
+        raise EwfFormatError(f"the private key could not be read as an RSA key ({exc}); "
+                             f"give it unencrypted, as PEM or DER") from None
+
+
+def _afm_next_extension(ext):
+    """The extension after ``ext`` in AFFLIB's split raw naming, else None."""
+    if len(ext) != 3:
+        return None
+    if ext.isascii() and ext.isdigit():
+        return "A00" if ext == "999" else f"{int(ext) + 1:03d}"
+    lower = ext[0].islower()
+    chars = list(ext.upper())
+    for i in (2, 1, 0):
+        c = chars[i]
+        if c == "Z":
+            chars[i] = "0"                      # and carry
+            continue
+        chars[i] = "A" if c == "9" else chr(ord(c) + 1)
+        out = "".join(chars)
+        return out.lower() if lower else out
+    return None
 
 
 def _afd_directory(path):
@@ -3028,8 +3179,9 @@ class EwfImage:
     in memory while the image is open, since every read needs them.
     """
 
-    def __init__(self, path, segments=None, password=None):
+    def __init__(self, path, segments=None, password=None, private_key=None):
         self._password = password
+        self._private_key = private_key
         self._keys: dict[str, object] = {}      # path -> _EncrcdsaKey, or None
         self._band_key = None
         self.encryption = None
@@ -3077,8 +3229,10 @@ class EwfImage:
         self.missing_page_ranges: list[tuple[int, int]] = []
         self.missing_page_count = 0
         self.bad_sectors = None
-        self._aff_pages: dict[int, tuple[int, int, int, int]] = {}
+        self._aff_pages: dict[int, tuple[int, int, int, int, str | None]] = {}
         self._aff_badflag = b""
+        self._aff_key = None
+        self.aff_header_lost: list[str] = []
         self.logical_root = None
         self.logical_entries: list[LogicalEntry] = []
         self._l01_media_size = None
@@ -3197,7 +3351,7 @@ class EwfImage:
         if magic == SIGNATURE_V2:
             self._index_v2()
             return
-        if magic == AF_HEADER:
+        if magic == AF_HEADER or (magic[:4] == b"AFF\x00" and _is_aff(self.paths[0])):
             self._index_aff()
             return
         if magic[:4] == b"PK\x03\x04" and is_aff4(self.paths[0]):
@@ -3466,12 +3620,16 @@ class EwfImage:
         name_of_file = os.path.basename(path)
         fh = self._handle(i)
         end = os.path.getsize(path)
-        fh.seek(0)
-        if _read_exactly(fh, len(AF_HEADER)) != AF_HEADER:
+        offset = _aff_start(fh, end)
+        if offset is None:
             raise EwfFormatError(f"{name_of_file} is not an AFF file")
-        pages: dict[int, tuple[int, int, int]] = {}
+        if offset == 0:
+            self.aff_header_lost.append(name_of_file)
+        # A page or segment stored both in the clear and encrypted (a copy the
+        # encryption left behind) is read encrypted, as AFFLIB reads it.
+        pages: dict[int, tuple[int, int, int, str | None]] = {}
         small: dict[str, tuple[int, bytes]] = {}
-        offset = len(AF_HEADER)
+        sealed: dict[str, tuple[int, bytes]] = {}
         while offset < end:
             if offset + _AF_SEGHEAD.size > end:
                 raise EwfIncompleteSetError(
@@ -3494,22 +3652,131 @@ class EwfImage:
             if tail_magic != b"ATT\x00" or seg_len != tail + _AF_SEGTAIL.size - offset:
                 raise EwfFormatError(f"{name_of_file}: the segment at {offset} has no "
                                      f"matching tail")
-            if name.endswith(AF_AES256_SUFFIX) or name.startswith("affkey"):
-                raise EwfFormatError(
-                    f"{name_of_file} is encrypted. ewfprobe does not read encrypted AFF")
-            page = _AF_PAGE_NAME.fullmatch(name)
+            encrypted = name.endswith(AF_AES256_SUFFIX)
+            base = name[:-len(AF_AES256_SUFFIX)] if encrypted else name
+            page = _AF_PAGE_NAME.fullmatch(base)
             if page:
-                pages[int(page.group(1))] = (data_offset, data_len, arg)
-            elif name and data_len <= _AFF_MAX_SMALL:
+                n = int(page.group(1))
+                if encrypted or n not in pages or pages[n][3] is None:
+                    pages[n] = (data_offset, data_len, arg, base if encrypted else None)
+            elif base and data_len <= _AFF_MAX_SMALL:
                 fh.seek(data_offset)
-                small[name] = (arg, _read_exactly(fh, data_len))
+                (sealed if encrypted else small)[base] = (arg, _read_exactly(fh, data_len))
             offset = tail + _AF_SEGTAIL.size
-        return pages, small, end
+        return pages, small, sealed, end
+
+    def _index_afm(self, label, small, page_size, image_size):
+        """Find an AFM's raw files and check them against its metadata; its pages
+        are read from them, never from the metadata file."""
+        ext = small.get("raw_image_file_extension", (0, b""))[1].rstrip(b"\x00")
+        try:
+            ext = ext.decode("ascii")
+        except UnicodeDecodeError:
+            ext = ""
+        if len(ext) != 3 or not ext.isalnum():
+            raise EwfFormatError(f"{label} is an AFM whose raw file extension is "
+                                 f"{ext!r}, not three letters or digits")
+        stem, dot, own = self.paths[0].rpartition(".")
+        if not dot or len(own) != 3:
+            raise EwfFormatError(f"{label} is an AFM, and AFFLIB finds its raw files only "
+                                 f"from a name ending in a three-letter extension (.afm)")
+        raw = [f"{stem}.{ext}"]
+        if not os.path.isfile(raw[0]):
+            raise EwfIncompleteSetError(f"{label} is an AFM, and its disk is kept in "
+                                        f"{os.path.basename(raw[0])} and the files after "
+                                        f"it, which is not beside it")
+        while True:
+            nxt = _afm_next_extension(raw[-1][-3:])
+            if nxt is None or not os.path.isfile(f"{stem}.{nxt}"):
+                break
+            raw.append(f"{stem}.{nxt}")
+        sizes = [os.path.getsize(p) for p in raw]
+        if len(raw) > 1 and any(size != sizes[0] for size in sizes[1:-1]):
+            raise EwfFormatError(f"{label}: its raw files are not all the size of the "
+                                 f"first but the last, which AFFLIB requires")
+        per_file = _af_quad(small.get("pages_per_raw_image_file")) or 0
+        if len(raw) > 1 and per_file and sizes[0] != per_file * page_size:
+            raise EwfFormatError(
+                f"{label}: its raw files are {sizes[0]:,} bytes each, and it records "
+                f"{per_file:,} pages of {page_size:,} bytes per file")
+        if sum(sizes) != image_size:
+            error = EwfIncompleteSetError if sum(sizes) < image_size else EwfFormatError
+            raise error(f"{label} records an image of {image_size:,} bytes, and its raw "
+                        f"files ({os.path.basename(raw[0])} .. "
+                        f"{os.path.basename(raw[-1])}) hold {sum(sizes):,}")
+        self.format = FORMAT_AFM
+        self.paths = [self.paths[0]] + raw
+        self.sizes = self.sizes[:1] + sizes
+        self._aff_pages = {}
+        self._afm_starts = [0]
+        for size in sizes[:-1]:
+            self._afm_starts.append(self._afm_starts[-1] + size)
+
+    def _chunk_data_afm(self, n):
+        start = n * self.chunk_size
+        want = min(self.chunk_size, self.media_size - start)
+        out = []
+        i = bisect.bisect_right(self._afm_starts, start) - 1
+        at = start
+        while want > 0:
+            fh = self._handle(i + 1)
+            fh.seek(at - self._afm_starts[i])
+            piece = _read_exactly(fh, min(want, self.sizes[i + 1]
+                                          - (at - self._afm_starts[i])))
+            out.append(piece)
+            at += len(piece)
+            want -= len(piece)
+            i += 1
+        return b"".join(out)
+
+    def _aff_unlock(self, label, keys):
+        """The file key of an encrypted AFF, from the passphrase or the private key
+        given, and what opened it recorded in ``encryption``."""
+        wrapped = keys.get(_AF_AFFKEY, (0, b""))[1]
+        seals = sorted((int(m.group(1)), data) for name, (_arg, data) in keys.items()
+                       if (m := _AF_AFFKEY_EVP.fullmatch(name)))
+        which = ("a certificate" if len(seals) == 1
+                 else f"one of the {len(seals)} certificates")
+        opens = (["its passphrase"] if wrapped else []) + (
+            [f"the private key of {which} it is sealed to"] if seals else [])
+        if not opens:
+            raise EwfFormatError(f"{label} has encrypted segments and no key segment to "
+                                 f"open them with")
+        if _AES is None:
+            raise EwfFormatError(f"{label} is an encrypted AFF; reading one needs the "
+                                 f"optional pycryptodome package (pip install "
+                                 f"pycryptodome), which this Python does not have")
+        tried = []
+        if self._password is not None and wrapped:
+            key = _aff_key_from_passphrase(label, wrapped, self._password)
+            if key is not None:
+                self.encryption = {"container": "AFF (AFFLIB)", "cipher": "AES-256-CBC",
+                                   "key_wrap": "AES-256-ECB", "kdf": "SHA-256",
+                                   "opened_with": "passphrase"}
+                return key
+            tried.append("the password given is not its passphrase")
+        if self._private_key is not None and seals:
+            rsa = _private_key(self._private_key)
+            for number, stored in seals:
+                key = _aff_key_from_seal(stored, rsa)
+                if key is not None:
+                    self.encryption = {"container": "AFF (AFFLIB)", "cipher": "AES-256-CBC",
+                                       "key_wrap": "RSA PKCS#1 v1.5 and AES-256-CBC",
+                                       "opened_with": f"private key (affkey_evp{number})"}
+                    return key
+            tried.append(f"the private key opens none of the {len(seals)} sealed "
+                         f"key{'' if len(seals) == 1 else 's'}")
+        if tried:
+            raise EwfWrongPasswordError(f"{label} is an encrypted AFF: {'; '.join(tried)}")
+        needs = "password" if wrapped else "private key"
+        raise EwfPasswordRequiredError(
+            f"{label} is an encrypted AFF and opens only with {' or '.join(opens)}",
+            needs=needs)
 
     def _same_page(self, n, first, second):
         """A page stored in two files of an AFD has to be the same page twice."""
         def stored(location):
-            i, offset, length, arg = location
+            i, offset, length, arg, _encrypted = location
             fh = self._handle(i)
             fh.seek(offset)
             return arg, _read_exactly(fh, length)
@@ -3536,9 +3803,23 @@ class EwfImage:
         small: dict[str, tuple[int, bytes]] = {}
         holder: dict[str, int] = {}
         image_sizes = []
-        for i, path in enumerate(self.paths):
-            pages, seen, end = self._walk_aff(i)
+        walked = [self._walk_aff(i) for i in range(len(self.paths))]
+        # The key segments are read from the first file that holds each, as every
+        # other segment is; an image with any encrypted segment needs the key.
+        keys: dict[str, tuple[int, bytes]] = {}
+        for _pages, seen, _sealed, _end in walked:
+            for key, value in seen.items():
+                if key == _AF_AFFKEY or _AF_AFFKEY_EVP.fullmatch(key):
+                    keys.setdefault(key, value)
+        if any(w[2] or any(p[3] for p in w[0].values()) for w in walked):
+            self._aff_key = self._aff_unlock(label, keys)
+        for i, (pages, seen, sealed, end) in enumerate(walked):
+            path = self.paths[i]
             self.sizes.append(end)
+            if self._aff_key is not None:
+                seen = dict(seen)
+                for key, (arg, data) in sealed.items():
+                    seen[key] = (arg, _aff_decrypt(self._aff_key, key, data))
             for key, value in seen.items():
                 if key == "imagesize" and _af_quad(value) is not None:
                     image_sizes.append(_af_quad(value))
@@ -3549,11 +3830,12 @@ class EwfImage:
                     raise EwfFormatError(
                         f"{label}: {os.path.basename(self.paths[holder[key]])} and "
                         f"{os.path.basename(path)} record different {key} values")
-            for n, (offset, length, arg) in pages.items():
+            for n, (offset, length, arg, encrypted) in pages.items():
                 if n in self._aff_pages:
-                    self._same_page(n, self._aff_pages[n], (i, offset, length, arg))
+                    self._same_page(n, self._aff_pages[n],
+                                    (i, offset, length, arg, encrypted))
                 else:
-                    self._aff_pages[n] = (i, offset, length, arg)
+                    self._aff_pages[n] = (i, offset, length, arg, encrypted)
 
         page_size = _af_number(small.get("pagesize") or small.get("segsize") or (0, b""))
         if not page_size:
@@ -3565,6 +3847,8 @@ class EwfImage:
                 f"{label} records no image size, which AFFLIB writes{where} when an "
                 f"acquisition finishes; reading it would report missing data as empty")
         image_size = max(image_sizes)
+        if small.get("aff_file_type", (0, b""))[1] == b"AFM" and self.format == FORMAT_AFF:
+            self._index_afm(label, small, page_size, image_size)
         sector_arg = _af_number(small.get("sectorsize", (0, b"")))
         self._aff_badflag = small.get("badflag", (0, b""))[1]
         self.bad_sectors = _af_quad(small.get("badsectors"))
@@ -3578,7 +3862,7 @@ class EwfImage:
             self.metadata["image_gid"] = gid.hex()
         for key, (arg, data) in small.items():
             if (key in _AF_STRUCTURAL or _AF_PAGE_HASH_NAME.fullmatch(key)
-                    or key.endswith(AF_SIG256_SUFFIX)):
+                    or _AF_AFFKEY_EVP.fullmatch(key) or key.endswith(AF_SIG256_SUFFIX)):
                 continue
             try:
                 value = data.decode("utf-8").strip("\x00").strip()
@@ -3598,6 +3882,9 @@ class EwfImage:
         self.compression_level = None
         needed = self._needed_chunks()
         self.chunk_count = needed
+        if self.format == FORMAT_AFM:           # every page is in the raw files
+            self._indexed_chunks = needed
+            return
         self._indexed_chunks = sum(1 for n in self._aff_pages if n < needed)
         # Built from the pages present, never by counting up to the image size: the
         # size is read from the file, and a damaged one can claim petabytes.
@@ -3621,16 +3908,19 @@ class EwfImage:
                                      f"no bad-sector marker to stand in for it")
             flag = self._aff_badflag
             return (flag * (self.chunk_size // len(flag) + 1))[:self.chunk_size]
-        i, offset, length, arg = location
+        i, offset, length, arg, encrypted = location
         fh = self._handle(i)
         fh.seek(offset)
         raw = _read_exactly(fh, length)
+        if encrypted:
+            raw = _aff_decrypt(self._aff_key, encrypted, raw)
         if not arg & AF_PAGE_COMPRESSED:
             return raw
         algorithm = arg & AF_PAGE_COMP_ALG_MASK
         if algorithm == AF_PAGE_COMP_ALG_ZERO:
-            if length != 4:
-                raise EwfFormatError(f"page {n} is a zero page with {length} bytes, not 4")
+            if len(raw) != 4:
+                raise EwfFormatError(f"page {n} is a zero page with {len(raw)} bytes, "
+                                     f"not 4")
             return b"\x00" * min(struct.unpack(">I", raw)[0], self.chunk_size)
         if algorithm == AF_PAGE_COMP_ALG_ZLIB:
             try:
@@ -6332,6 +6622,8 @@ class EwfImage:
         if self.format in (FORMAT_AFF, FORMAT_AFD):
             data = self._chunk_data_aff(n)
             return self._keep(n, data, want)
+        if self.format == FORMAT_AFM:
+            return self._keep(n, self._chunk_data_afm(n), want)
         if self.format == FORMAT_UDIF:
             return self._keep(n, self._chunk_data_udif(n), want)
         if self.format == FORMAT_SPARSEIMAGE:
@@ -6575,6 +6867,7 @@ class EwfImage:
             "stored_bands": len(self._bands) if self.format == FORMAT_SPARSEIMAGE else None,
             "sparsebundle": None if self.sparsebundle is None else dict(self.sparsebundle),
             "encryption": None if self.encryption is None else dict(self.encryption),
+            "aff_header_lost": list(self.aff_header_lost),
             "aff4": None if self.aff4 is None else dict(self.aff4),
             "vhd": None if self.vhd is None else dict(self.vhd),
             "vhdx": None if self.vhdx is None else dict(self.vhdx),
@@ -6586,9 +6879,10 @@ class EwfImage:
         }
 
 
-def open_ewf(path, segments=None, password=None) -> EwfImage:
+def open_ewf(path, segments=None, password=None, private_key=None) -> EwfImage:
     """Open an acquisition ewfprobe reads: an EWF, EWF2 or L01 set from any path in
-    it, an AFF file, an AFD directory from the directory or any file in it, an AFF4
+    it, an AFF file, an AFM from its .afm with its raw files beside it, an AFD
+    directory from the directory or any file in it, an AFF4
     container (a striped one from any of its files), an Apple
     .dmg (a segmented one from its .dmg) or .sparseimage, or a sparse bundle from its
     folder, an AD1 set from any of its files, or an AD-encrypted E01, SMART or raw set
@@ -6597,8 +6891,10 @@ def open_ewf(path, segments=None, password=None) -> EwfImage:
     extents). An encrypted Apple disk image or AD-encrypted set opens
     with ``password`` (a str, used as UTF-8, or bytes); without one it raises
     EwfPasswordRequiredError, and with one that does not open it
-    EwfWrongPasswordError."""
-    return EwfImage(path, segments=segments, password=password)
+    EwfWrongPasswordError. An encrypted AFF opens with its passphrase as
+    ``password``, or with ``private_key`` (a path, or the bytes, of an unencrypted
+    PEM or DER RSA key) when it is sealed to a certificate."""
+    return EwfImage(path, segments=segments, password=password, private_key=private_key)
 
 
 open_image = open_ewf
@@ -6642,8 +6938,13 @@ def _open_cli(args):
     asked = 0
     while True:
         try:
-            return open_ewf(args.image, password=password)
+            return open_ewf(args.image, password=password, private_key=args.private_key)
         except EwfPasswordError as exc:
+            if getattr(exc, "needs", "password") == "private key":
+                if args.private_key:
+                    raise
+                raise EwfPasswordRequiredError(f"{exc}; give that key with --private-key",
+                                               needs="private key") from None
             given = args.password_file or args.password_env
             if given or not sys.stdin.isatty() or asked == 3:
                 if isinstance(exc, EwfPasswordRequiredError) and not given:
@@ -6860,10 +7161,19 @@ def _cmd_info(args):
         if d["missing_page_count"]:
             print(f"missing pages   {d['missing_page_count']:,}, read as the "
                   f"bad-sector marker")
-        if d["encryption"]:
+        if d["encryption"] and "opened_with" in d["encryption"]:
+            e = d["encryption"]                 # an encrypted AFF
+            print(f"encryption      {e['cipher']}, {e['container']}; its key opened "
+                  f"with the {e['opened_with']}")
+        elif d["encryption"]:
             e = d["encryption"]
             print(f"encryption      {e['cipher']}, {e['container']}; key wrapped with "
                   f"{e['key_wrap']}, {e['kdf']}, {e['kdf_rounds']:,} rounds")
+        if d.get("aff_header_lost"):
+            print(f"AFF header      overwritten by a segment in "
+                  f"{', '.join(d['aff_header_lost'])}, as AFFLIB 3.7.22's affcrypto -e "
+                  f"leaves a file it encrypts in place; read from the segments, which "
+                  f"AFFLIB cannot do")
         for name, value in d["stored_hashes"].items():
             print(f"stored {name:<9}{value}")
         if d["metadata"]:
@@ -7049,12 +7359,16 @@ def main(argv=None):
 
     for s in sub.choices.values():
         s.add_argument("--password-file", metavar="FILE", default=None,
-                       help="for an encrypted Apple disk image or AD-encrypted set: "
-                            "read its password from the first line of FILE")
+                       help="for an encrypted Apple disk image, AD-encrypted set or "
+                            "encrypted AFF: read its password from the first line of FILE")
         s.add_argument("--password-env", metavar="NAME", default=None,
-                       help="for an encrypted Apple disk image or AD-encrypted set: "
-                            "take its password from the environment variable NAME. "
+                       help="for an encrypted Apple disk image, AD-encrypted set or "
+                            "encrypted AFF: take its password from the environment "
+                            "variable NAME. "
                             "Without either, ewfprobe asks for it at a terminal")
+        s.add_argument("--private-key", metavar="FILE", default=None,
+                       help="for an encrypted AFF sealed to a certificate: the "
+                            "certificate's RSA private key, unencrypted, as PEM or DER")
     args = ap.parse_args(argv)
     try:
         status = args.func(args)
