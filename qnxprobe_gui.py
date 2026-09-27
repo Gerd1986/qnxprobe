@@ -120,22 +120,49 @@ def run_window(initial_paths):
     # passwords: an encrypted image's password, by path, once it has opened the
     # image; kept in memory for this window only, never written anywhere
     state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={},
-                 bl_secrets={}, bl_keys={})
+                 bl_secrets={}, bl_keys={}, aff_keys={})
 
     def ask_password(path, wrong):
         """The password for an encrypted image, asked for on the main thread, or None
         when the examiner cancels."""
         name = os.path.basename(os.path.normpath(path))
+        kind = q.acquisition_format(path)
         what = ("an acquisition FTK Imager encrypted with AD encryption"
-                if q.acquisition_format(path) == "AD_ENCRYPTED"
+                if kind == "AD_ENCRYPTED" else "an encrypted AFF" if kind in ("AFF", "AFD")
                 else "an encrypted Apple disk image")
         prompt = (f"That password does not open {name}. Its password:" if wrong else
                   f"{name} is {what}. Its password:")
         return simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
 
+    def unlock_key(path):
+        """Ask for the private key file of an AFF sealed to a certificate until one
+        opens it, and keep its path; True when kept (or not needed), False when the
+        examiner cancels."""
+        if path in state["aff_keys"] or not q.needs_private_key(path):
+            return True
+        name = os.path.basename(os.path.normpath(path))
+        while True:
+            key = filedialog.askopenfilename(
+                title=f"{name} is sealed to a certificate: its RSA private key",
+                filetypes=[("Private key", "*.pem *.key *.der"), ("All files", "*")])
+            if not key:
+                return False
+            try:
+                q.open_image(path, private_key=key).close()
+            except q.ImagePasswordError:
+                messagebox.showerror("qnxprobe", f"That key does not open {name}.")
+                continue
+            except Exception as exc:        # pylint: disable=broad-exception-caught
+                messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
+                return False
+            state["aff_keys"][path] = key
+            return True
+
     def unlock(path):
         """Ask for an encrypted image's password until it opens the image, and keep
         it; True when it is kept (or not needed), False when the examiner cancels."""
+        if not unlock_key(path):
+            return False
         if path in state["passwords"] or not q.needs_password(path):
             return True
         wrong = False
@@ -162,7 +189,8 @@ def run_window(initial_paths):
         secrets = state["bl_secrets"].setdefault(path, [])
         keys = state["bl_keys"].setdefault(path, [])
         try:
-            with q.open_image(path, password=state["passwords"].get(path)) as fh:
+            with q.open_image(path, password=state["passwords"].get(path),
+                              private_key=state["aff_keys"].get(path)) as fh:
                 _fh, found = q.unlock_bitlocker(fh, q.image_size(fh), secrets, keys)
                 for bl in found:
                     wrong = False
@@ -404,6 +432,8 @@ def run_window(initial_paths):
             args += ["--password-env", f"QNXPROBE_PASSWORD_{n}"]
         for key in sorted({k for p in paths for k in state["bl_keys"].get(p, [])}):
             args += ["--bitlocker-key", key]
+        for key in sorted({state["aff_keys"][p] for p in paths if p in state["aff_keys"]}):
+            args += ["--private-key", key]
         state["child_env"] = env
         return args + paths
 
@@ -521,7 +551,8 @@ def run_window(initial_paths):
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
             try:
-                fh = q.open_image(path, password=state["passwords"].get(path))
+                fh = q.open_image(path, password=state["passwords"].get(path),
+                                  private_key=state["aff_keys"].get(path))
                 fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
                                                 state["bl_secrets"].get(path, []),
                                                 state["bl_keys"].get(path, []))

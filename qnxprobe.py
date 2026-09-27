@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.46"
+QNXPROBE_VERSION = "1.47"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -148,14 +148,17 @@ class ImageUnreadable(Exception):
 
 
 class ImagePasswordError(ImageUnreadable):
-    """An encrypted image (an Apple disk image, or an acquisition FTK Imager wrote
-    with AD encryption) was opened without its password (``wrong`` is
-    False) or with one that does not open it (``wrong`` is True). A caller that
-    asks for the password can tell the two apart and ask again."""
+    """An encrypted image (an Apple disk image, an acquisition FTK Imager wrote
+    with AD encryption, or an encrypted AFF) was opened without its password
+    (``wrong`` is False) or with one that does not open it (``wrong`` is True). A
+    caller that asks for the password can tell the two apart and ask again.
+    ``needs`` is "password", or "private key" for an AFF sealed only to a
+    certificate, which opens with that certificate's private key instead."""
 
-    def __init__(self, message, wrong):
+    def __init__(self, message, wrong, needs="password"):
         super().__init__(message)
         self.wrong = wrong
+        self.needs = needs
 
 
 # The first eight bytes of each acquisition container the vendored ewfprobe
@@ -270,6 +273,27 @@ def _virtual_disk_kind(path):
     return None
 
 
+def _aff_header_lost(path):
+    """True when an AFF segment stands where the AFF header belongs and its tail is
+    where its lengths put it, which is how AFFLIB 3.7.22's affcrypto -e leaves a file
+    it encrypts in place. ewfprobe reads such a file from its segments."""
+    try:
+        size = os.path.getsize(path)
+        with open(path, "rb") as fh:
+            head = fh.read(16)
+            if len(head) < 16 or head[:4] != b"AFF\x00":
+                return False
+            name_len, data_len = struct.unpack_from(">II", head, 4)
+            tail = 16 + name_len + data_len
+            if name_len > 1024 or tail + 8 > size:
+                return False
+            fh.seek(tail)
+            trailer = fh.read(8)
+    except (OSError, struct.error):
+        return False
+    return trailer[:4] == b"ATT\x00" and struct.unpack(">I", trailer[4:])[0] == tail + 8
+
+
 def _first_bytes(path, n=8):
     try:
         with open(path, "rb") as fh:
@@ -337,10 +361,32 @@ def _ad1_first(path):
     return os.path.join(folder, first) if first else None
 
 
+def _aff_needs(path):
+    """What an encrypted AFF opens with ("password" or "private key"), found by
+    opening it without either; None for an AFF that is not encrypted."""
+    if ewfprobe is None or acquisition_format(path) not in ("AFF", "AFD"):
+        return None
+    try:
+        ewfprobe.open_ewf(path).close()
+    except ewfprobe.EwfPasswordRequiredError as exc:
+        return getattr(exc, "needs", "password")
+    except ewfprobe.EwfError:
+        return None
+    return None
+
+
 def needs_password(path):
     """True when path is an image that opens only with its password: an encrypted
-    Apple disk image, or an acquisition FTK Imager encrypted with AD encryption."""
-    return acquisition_format(path) in PASSWORD_FORMATS
+    Apple disk image, an acquisition FTK Imager encrypted with AD encryption, or an
+    AFF encrypted with a passphrase."""
+    return (acquisition_format(path) in PASSWORD_FORMATS
+            or _aff_needs(path) == "password")
+
+
+def needs_private_key(path):
+    """True when path is an AFF sealed only to a certificate, which opens with that
+    certificate's RSA private key rather than a password."""
+    return _aff_needs(path) == "private key"
 
 
 def acquisition_format(path):
@@ -380,7 +426,7 @@ def acquisition_format(path):
         return "EWF"
     if head == EWF2_SIGNATURE:
         return "EWF2"
-    if head == AFF_SIGNATURE:
+    if head == AFF_SIGNATURE or _aff_header_lost(path):
         return "AFD" if _afd_folder(path) else "AFF"
     if head == L01_SIGNATURE:
         return "L01"
@@ -612,13 +658,15 @@ def image_size(fh):
             fh.seek(here)
 
 
-def open_image(path, segments=None, password=None):
+def open_image(path, segments=None, password=None, private_key=None):
     """Open an image read-only: the one file, or every segment of the split
     image it belongs to, joined. segments is split_segments(path) when the
-    caller already has it. password opens an encrypted Apple disk image or an
-    acquisition FTK Imager encrypted with AD encryption (a str,
-    used as UTF-8, or bytes); without it, or with one that does not open the
-    image, ImagePasswordError is raised. Other images ignore it."""
+    caller already has it. password opens an encrypted Apple disk image, an
+    acquisition FTK Imager encrypted with AD encryption or an encrypted AFF (a str,
+    used as UTF-8, or bytes), and private_key (a path to, or the bytes of, an
+    unencrypted PEM or DER RSA key) an AFF sealed to a certificate; without what
+    opens it, or with one that does not, ImagePasswordError is raised. Other
+    images ignore both."""
     kind = acquisition_format(path)
     name = os.path.basename(os.path.normpath(path))
     if kind in ("L01", "Lx01", "AD1"):
@@ -634,16 +682,17 @@ def open_image(path, segments=None, password=None):
                 f"Export the image to raw, or put ewfprobe.py back.")
         # ewfprobe joins the segments or files of the set itself, from the
         # format's own records rather than from the file names, and refuses an
-        # incomplete set.
-        if kind not in PASSWORD_FORMATS:
-            return ewfprobe.open_ewf(path)
-        # ewfprobe decrypts it, given the password; without the optional cipher
-        # package it refuses the image, naming the package
+        # incomplete set. It decrypts an encrypted image given what opens it; without
+        # the optional cipher package it refuses the image, naming the package.
+        given = {"password": password}
+        if private_key is not None:
+            given["private_key"] = private_key
         try:
-            image = ewfprobe.open_ewf(path, password=password)
+            image = ewfprobe.open_ewf(path, **given)
         except ewfprobe.EwfPasswordError as exc:
             raise ImagePasswordError(
-                str(exc), isinstance(exc, ewfprobe.EwfWrongPasswordError)) from None
+                str(exc), isinstance(exc, ewfprobe.EwfWrongPasswordError),
+                getattr(exc, "needs", "password")) from None
         # What an AD-encrypted set decrypts to can be logical evidence as well
         inner = {"EWF-L01": "L01", "AD1": "AD1"}.get(getattr(image, "format", None))
         if inner:
@@ -681,6 +730,7 @@ _ACQUISITION_LABELS = {
     "SPARSEIMAGE": "an Apple sparse image",
     "SPARSEBUNDLE": "an Apple sparse bundle",
     "UDRW": "an Apple read-write disk image",
+    "AFM": "an AFM acquisition",
     "RAW": "a raw (dd) image",
     "VHD": "a VHD virtual disk",
     "VHDX": "a VHDX virtual disk",
@@ -695,7 +745,9 @@ def describe_acquisition(image):
     parts = list(getattr(image, "paths", []) or [])
     fmt = getattr(image, "format", None)
     crypt = getattr(image, "encryption", None)
-    locked = (f", encrypted ({crypt['cipher']}) and opened with its password"
+    opener = ("its private key" if str((crypt or {}).get("opened_with", ""))
+              .startswith("private key") else "its password")
+    locked = (f", encrypted ({crypt['cipher']}) and opened with {opener}"
               if crypt else "")
     if fmt == "SPARSEBUNDLE":
         bundle = getattr(image, "sparsebundle", None) or {}
@@ -703,8 +755,8 @@ def describe_acquisition(image):
         return (f"an Apple sparse bundle of {stored:,} stored band "
                 f"file{'' if stored == 1 else 's'}, read by the reader{locked}")
     label = _ACQUISITION_LABELS.get(fmt, "an acquisition")
-    unit = ("files" if fmt in ("AFF", "AFD", "AFF4", "UDIF", "SPARSEIMAGE", "UDRW",
-                               "VHD", "VHDX", "VMDK", "QCOW")
+    unit = ("files" if fmt in ("AFF", "AFD", "AFM", "AFF4", "UDIF", "SPARSEIMAGE",
+                               "UDRW", "VHD", "VHDX", "VMDK", "QCOW")
             else "segments")
     # a differencing disk, delta or overlay is read through the disks under it
     parents = [os.path.basename((getattr(q, "paths", None) or ["?"])[0])
@@ -10979,16 +11031,19 @@ def volumes(fh, size=None):
     return out
 
 
-def open_image_trying(path, segments=None, passwords=()):
+def open_image_trying(path, segments=None, passwords=(), private_keys=()):
     """open_image with the first of ``passwords`` that opens it, for an encrypted
-    Apple disk image or an AD-encrypted acquisition; any other image opens with none. Raises ImagePasswordError
-    when none of them does (wrong is True) or none was given (wrong is False)."""
+    Apple disk image, an AD-encrypted acquisition or an encrypted AFF (which the
+    first of ``private_keys`` that opens it also opens when it is sealed to a
+    certificate); any other image opens with none. Raises ImagePasswordError when
+    none of them does (wrong is True) or none was given (wrong is False)."""
     last = None
     for password in list(passwords) or [None]:
-        try:
-            return open_image(path, segments, password=password)
-        except ImagePasswordError as exc:
-            last = exc
+        for key in list(private_keys) or [None]:
+            try:
+                return open_image(path, segments, password=password, private_key=key)
+            except ImagePasswordError as exc:
+                last = exc
     raise last
 
 
@@ -11012,12 +11067,12 @@ def _cli_passwords(files, env_names):
 
 def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
          extract=None, only=None, zf=None, do_triage=False, exclude=None,
-         reporter=None, manifest=None, passwords=(), key_files=()):
+         reporter=None, manifest=None, passwords=(), key_files=(), private_keys=()):
     # a set that is not whole raises SplitImageError; an acquisition's reader joins
     # its own files (an AD-encrypted raw set is numbered like a split image, and its
     # files are ciphertext until the reader decrypts them)
     segments = [] if acquisition_format(path) else split_segments(path)
-    image = open_image_trying(path, segments, passwords)
+    image = open_image_trying(path, segments, passwords, private_keys)
     # A BitLocker volume the passwords (as passwords or recovery passwords) or the
     # startup key files open is read decrypted in place; the rest stay locked and
     # the report says so.
@@ -13409,6 +13464,42 @@ def self_test():
                          vmdk_sparse_fake, vmdk_cowd_fake, qcow_fake)
         virtual_kinds = ["VHD", "VHD", "VHDX", "VMDK", "VMDK", "VMDK", "QCOW"]
 
+        class _KeyOnly:
+            """A stand-in for the reader, whose image opens only with a private key."""
+            class EwfError(Exception):
+                pass
+
+            class EwfPasswordError(EwfError):
+                pass
+
+            class EwfWrongPasswordError(EwfPasswordError):
+                pass
+
+            class EwfPasswordRequiredError(EwfPasswordError):
+                def __init__(self, message, needs="password"):
+                    super().__init__(message)
+                    self.needs = needs
+
+            def open_ewf(self, path, password=None, private_key=None):
+                raise self.EwfPasswordRequiredError("sealed", needs="private key")
+
+        def _needs_from(reader):
+            saved = ewfprobe
+            try:
+                globals()["ewfprobe"] = reader
+                try:
+                    open_image(ewf_fake)
+                except ImagePasswordError as exc:
+                    return exc.wrong, exc.needs
+                return None
+            finally:
+                globals()["ewfprobe"] = saved
+
+        class _Opened:
+            """A stand-in for an AFF a private key opened."""
+            format, paths = "AFF", ["x.aff"]
+            encryption = {"cipher": "AES-256-CBC", "opened_with": "private key (affkey_evp0)"}
+
         class _Chain:
             """A stand-in for a reader's image read over a parent."""
 
@@ -13578,6 +13669,11 @@ def self_test():
                  "read",
                  saved_reader is None or all(_ewf_refused_by_reader(q)
                                              for q in virtual_fakes)),
+                ("an image the reader says opens only with a private key is refused "
+                 "saying so, and one a key opened is described as opened with it",
+                 _needs_from(_KeyOnly()) == (False, "private key")
+                 and describe_acquisition(_Opened()).endswith(
+                     "encrypted (AES-256-CBC) and opened with its private key")),
                 ("a disk read over parents names each, nearest first, and records "
                  "every parent file with its size",
                  describe_acquisition(_Chain("QCOW", [vhd_dynamic_fake], _Chain(
@@ -13657,6 +13753,113 @@ def self_test():
                      [acquisition_format(q) for q in (vd_fixed, vd_dynamic)]
                      == ["VHD", "VHD"]
                      and _reads_as_disk(vd_fixed) and _reads_as_disk(vd_dynamic)),):
+                if not cond:
+                    ok = False
+                print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+        # An AFF encrypted with a passphrase and an AFM, built by hand from AFFLIB's
+        # layout (include/afflib/afflib.h, lib/crypto.cpp, lib/afflib.cpp and
+        # lib/vnode_afm.cpp at v3.7.22), written out again here rather than taken from
+        # the reader: big-endian segments "AFF\0", name and data lengths, an argument,
+        # the name, the data and "ATT\0" with the segment's length; an encrypted one
+        # named <name>/aes256, AES-256-CBC with the name (15 bytes at most, then
+        # zeros) as its IV, its length the padded length plus the remainder of the
+        # plain length mod 16; the file key in affkey_aes256, version 1, then the key
+        # and a block of zeros each AES-256-ECB under the SHA-256 of the passphrase.
+        def _aff_seg(name, data=b"", arg=0):
+            raw = name.encode()
+            body = struct.pack(">4sIII", b"AFF\x00", len(raw), len(data), arg) + raw + data
+            return body + struct.pack(">4sI", b"ATT\x00", len(body) + 8)
+
+        aff_disk = bytes((i * 7 + 3) & 0xFF for i in range(8190))  # a short last page
+        aff_quad = struct.pack(">II", len(aff_disk), 0)            # low word, then high
+        aff_cipher = getattr(saved_reader, "_AES", None) if saved_reader is not None else None
+        # the header-lost shape needs no reader to be recognised
+        lost = os.path.join(d, "vd", "lost-header.aff")
+        with open(lost, "wb") as fh:
+            fh.write(_aff_seg("badsectors/aes256", bytes(24), 2) + _aff_seg("x", b"y"))
+        not_lost = os.path.join(d, "vd", "not-aff.bin")
+        with open(not_lost, "wb") as fh:
+            fh.write(b"AFF\x00" + bytes(60))
+        for label, cond in (
+                ("an AFF whose header a segment overwrote (as affcrypto -e leaves one) "
+                 "is named AFF with and without the reader, and bytes that only begin "
+                 "like a segment are not",
+                 [acquisition_format(q) for q in (lost, not_lost)] == ["AFF", None]
+                 and _kinds_without_reader((lost, not_lost)) == ["AFF", None]),):
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+        if aff_cipher is None:
+            print("  [SKIP] an encrypted AFF opens with its passphrase, and an AFM reads "
+                  "from its raw file (needs the vendored ewfprobe and pycryptodome)")
+        else:
+            import hashlib                  # pylint: disable=import-outside-toplevel
+            aff_pw = "qnxprobe-aff"
+            file_key = bytes(range(32, 64))
+
+            def _aff_cbc(name, data):
+                extra = len(data) % 16
+                padded = data + bytes([16]) * ((16 - extra) % 16)
+                ecb = aff_cipher.new(file_key, aff_cipher.MODE_ECB)
+                out, prev = bytearray(), name.encode()[:15].ljust(16, b"\x00")
+                for i in range(0, len(padded), 16):
+                    prev = ecb.encrypt(bytes(a ^ b for a, b in zip(padded[i:i + 16], prev)))
+                    out += prev
+                return bytes(out) + bytes(extra)       # AFFLIB writes the remainder after
+
+            wrap = aff_cipher.new(hashlib.sha256(aff_pw.encode()).digest(),
+                                  aff_cipher.MODE_ECB)
+            enc_aff = os.path.join(d, "vd", "built-encrypted.aff")
+            with open(enc_aff, "wb") as fh:
+                fh.write(b"AFF10\r\n\x00" + _aff_seg("pagesize", b"", 4096)
+                         + _aff_seg("sectorsize", b"", 512)
+                         + _aff_seg("affkey_aes256", struct.pack(">I", 1)
+                                    + wrap.encrypt(file_key) + wrap.encrypt(bytes(16)))
+                         + _aff_seg("page0/aes256", _aff_cbc("page0", aff_disk[:4096]))
+                         + _aff_seg("page1/aes256", _aff_cbc("page1", aff_disk[4096:]))
+                         + _aff_seg("imagesize/aes256", _aff_cbc("imagesize", aff_quad), 2))
+            afm = os.path.join(d, "vd", "built.afm")
+            with open(afm, "wb") as fh:
+                fh.write(b"AFF10\r\n\x00" + _aff_seg("aff_file_type", b"AFM")
+                         + _aff_seg("raw_image_file_extension", b"000")
+                         + _aff_seg("pagesize", b"", 4096) + _aff_seg("sectorsize", b"", 512)
+                         + _aff_seg("pages_per_raw_image_file", bytes(8), 2)
+                         + _aff_seg("imagesize", aff_quad, 2))
+            with open(os.path.join(d, "vd", "built.000"), "wb") as fh:
+                fh.write(aff_disk)
+
+            def _described(path):
+                with open_image(path) as handle:
+                    return describe_acquisition(handle)
+
+            def _aff_refusal(password):
+                try:
+                    open_image(enc_aff, password=password).close()
+                except ImagePasswordError as exc:
+                    return exc.wrong, exc.needs
+                return None
+
+            def _reads_aff(path, password=None):
+                try:
+                    with open_image(path, password=password) as handle:
+                        handle.seek(0)
+                        return (image_size(handle) == len(aff_disk)
+                                and handle.read(len(aff_disk)) == aff_disk, handle.format)
+                except Exception:           # pylint: disable=broad-exception-caught
+                    return False, None
+
+            for label, cond in (
+                    ("a hand-built encrypted AFF needs its passphrase, refuses a wrong one, "
+                     "and with it reads as the disk it holds, a short last page included",
+                     needs_password(enc_aff) and not needs_private_key(enc_aff)
+                     and _aff_refusal(None) == (False, "password")
+                     and _aff_refusal("not it") == (True, "password")
+                     and _reads_aff(enc_aff, aff_pw) == (True, "AFF")),
+                    ("a hand-built AFM reads from the raw file beside it, and the report "
+                     "names it as an AFM of two files",
+                     _reads_aff(afm) == (True, "AFM")
+                     and _described(afm).startswith("an AFM acquisition of 2 files"))):
                 if not cond:
                     ok = False
                 print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
@@ -16542,8 +16745,9 @@ if __name__ == "__main__":
                          "stderr, for a caller driving this as a subprocess. stdout, "
                          "the human readable report, is unchanged")
     ap.add_argument("--password-file", metavar="FILE", action="append", default=[],
-                    help="for an encrypted image (an Apple disk image or an AD-encrypted "
-                         "FTK Imager acquisition) or a BitLocker volume: a password or "
+                    help="for an encrypted image (an Apple disk image, an AD-encrypted "
+                         "FTK Imager acquisition or an encrypted AFF) or a BitLocker "
+                         "volume: a password or "
                          "recovery password, the first line of FILE. Repeatable; each "
                          "opens with the first one that opens it")
     ap.add_argument("--password-env", metavar="NAME", action="append", default=[],
@@ -16555,6 +16759,10 @@ if __name__ == "__main__":
     ap.add_argument("--bitlocker-key", metavar="FILE", action="append", default=[],
                     help="a BitLocker startup key (a .BEK file), tried against every "
                          "BitLocker volume. Repeatable")
+    ap.add_argument("--private-key", metavar="FILE", action="append", default=[],
+                    help="for an AFF sealed to a certificate: the certificate's RSA "
+                         "private key, unencrypted, as PEM or DER. Repeatable; each "
+                         "image opens with the first one that opens it")
     ap.add_argument("--version", action="version",
                     version=f"qnxprobe {QNXPROBE_VERSION}")
     args = ap.parse_args()
@@ -16594,9 +16802,15 @@ if __name__ == "__main__":
                              do_triage=args.triage, exclude=args.exclude,
                              reporter=reporter, manifest=manifest,
                              passwords=given_passwords or asked,
-                             key_files=args.bitlocker_key)
+                             key_files=args.bitlocker_key, private_keys=args.private_key)
                         break
                     except ImagePasswordError as exc:
+                        if exc.needs == "private key":
+                            if args.private_key:
+                                raise
+                            raise ImagePasswordError(
+                                f"{exc}; give that key with --private-key", False,
+                                "private key") from None
                         # asked for at a terminal only when none was given, three
                         # tries; otherwise refused like any image that will not open
                         if given_passwords or not sys.stdin.isatty() or tries == 3:
