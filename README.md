@@ -380,9 +380,32 @@ directory records, inodes and their extended fields, file extents including spar
 ones, symbolic links, and files compressed with the `decmpfs` attribute in its zlib
 forms.
 
-What it does not do: an encrypted volume is named and not walked, and a file
-compressed with LZVN or LZFSE is listed with its size and refuses to be read. Nothing
-here reads a snapshot: what is walked is the volume as the newest checkpoint leaves it.
+What it does not do: an encrypted volume whose blocks are ciphertext in the image is
+named, marked `encrypted and locked, not read`, and not walked, and a file compressed
+with LZVN or LZFSE is listed with its size and refuses to be read. Nothing here reads a
+snapshot: what is walked is the volume as the newest checkpoint leaves it.
+
+An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
+Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are
+ciphertext in a given image is a separate question, and the volume's own blocks answer
+it: when the root node of its file-system tree passes its Fletcher-64 checksum, the
+image holds the volume decrypted, and it is read and marked `encrypted, read in the
+clear`; when it does not, the volume is locked. An acquisition made through the Mac's
+own decryption stores a volume that way: on Digital Collector 3.7's AFF4 of an Apple
+silicon MacBook Pro, whose log says it enabled "crypto I/O" for the encrypted Data
+volume, that volume reads in the clear, and 198 of 200 property lists read from it
+parse (one is LZVN-compressed, one holds a date Python cannot represent). Before 1.44
+both kinds were walked as though they were plain: the one in the clear happened to
+read, and a locked one was missing from listings with nothing saying why. A report
+and `volumes()` now say which is which, in a `note` beside the volume list.
+
+The self-test reads an image `tools/make_apfs_encrypted_fixture.sh` builds on any Mac:
+a plain volume, and a volume `diskutil` encrypted with a test passphrase, which APFS
+encrypts in software. The plain volume's files must match what macOS wrote and the
+encrypted one must be named locked with its tree never parsed. The in-the-clear case is
+built from the plain fixture by clearing the flag and sealing the superblock's
+checksum again, and must read every entry; with the tree's root node replaced by noise,
+the same volume must read as locked.
 
 Validated against The Sleuth Kit's APFS support, an entirely separate implementation.
 A 32 MiB container written by macOS itself and populated through its own driver ships
@@ -1100,10 +1123,15 @@ by its own first bytes rather than its name:
 | Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
 | any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
 | an E01, SMART or raw (dd) set FTK Imager encrypted with AD encryption, since 1.42 | the first file (`.E01`, `.s01`), or any `.001`, `.002`, ... of a raw set, with its password |
+| AFF4 (standard v1.0 or Evimetry's pre-standard layout), since 1.44 | the `.aff4`, or any file of one striped across several, with the others beside it |
 
 A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
 has no trailer: it is the disk's bytes as they are, and has always been read as a raw
-image. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
+image. An AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
+Standard has its writer put in the ZIP comment or in a first member named
+`container.description`; ewfprobe reads its map, image streams (stored, Snappy, LZ4
+or deflate) and symbolic streams, and reports an AFF4 whose streams it cannot find
+beside it as incomplete. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
 ewfprobe, and is refused, naming it, without. Since 1.41 an Apple disk image encrypted
 with a password (`hdiutil -encryption`, AES-128 or AES-256; a `.dmg`, a split one, a
 `.sparseimage` or a `.sparsebundle`) is read with that password, which needs the
@@ -1457,10 +1485,10 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
 ## What it does not do
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
-  is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, `.dmg`
-  (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle` is read
+  is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
+  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle` is read
   through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
-  Lx01 logical evidence is refused, since it holds no disk. AFF4, AD1 and the other
+  Lx01 logical evidence is refused, since it holds no disk. AD1 and the other
   evidence containers are not decoded; such a file is read as plain raw bytes, so
   export the raw image from the imaging tool first. A segment set is joined only when it is whole from its first
   segment (see "Split images" above). A lone first segment is read as the file it is,
@@ -1481,8 +1509,9 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
 - **It decrypts BitLocker, not a filesystem's own encryption.** An encrypted Apple disk
   image or an AD-encrypted acquisition opens with its password, and a BitLocker volume
   with its key (above), because that encryption wraps the whole volume. An encrypted APFS
-  volume, an NTFS file encrypted on its own, and a volume with encrypted filenames are
-  flagged, not opened. A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
+  volume whose blocks are ciphertext in the image, an NTFS file encrypted on its own, and
+  a volume with encrypted filenames are flagged, not opened; an APFS volume the image
+  holds decrypted is read (see APFS above). A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
