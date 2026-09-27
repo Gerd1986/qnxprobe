@@ -1020,12 +1020,22 @@ by its own first bytes rather than its name:
 | Apple disk image split by `hdiutil segment`, since 1.40 | the `.dmg`, with its `.dmgpart` files beside it |
 | Apple sparse image, since 1.39 | the `.sparseimage` |
 | Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
+| any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
 
 A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
 has no trailer: it is the disk's bytes as they are, and has always been read as a raw
 image. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
-ewfprobe, and is refused, naming it, without. An encrypted Apple disk image is
-refused: it needs its password, and so is an encrypted sparse bundle. A `.dmgpart` on
+ewfprobe, and is refused, naming it, without. Since 1.41 an Apple disk image encrypted
+with a password (`hdiutil -encryption`, AES-128 or AES-256; a `.dmg`, a split one, a
+`.sparseimage` or a `.sparsebundle`) is read with that password, which needs the
+optional `pycryptodome` package and is refused, naming it, without. Give the password
+with `--password-file FILE` (its first line) or `--password-env NAME` (an environment
+variable), both repeatable, and each image opens with the first that opens it; without
+either, qnxprobe asks at a terminal. The window asks for it once per image and keeps it
+in memory for the session, and hands it to the report it runs through an environment
+variable, never on a command line. From Python, `open_image(path, password=...)`
+raises `ImagePasswordError`, whose `wrong` says whether a password was given, when the
+image does not open. Before 1.41 an encrypted image was refused. A `.dmgpart` on
 its own is refused by the reader, which names the `.dmg` to open instead, and a split
 `.dmg` with a segment missing is refused rather than read short. A sparse bundle is
 recognised by its `Info.plist`, whatever the folder is called. Before 1.40 a sparse
@@ -1052,7 +1062,9 @@ files of an L01 (`python3 ewfprobe.py files evidence.L01`).
 This is `ewfprobe.py`, vendored from
 [abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
 `vendored.json`. It is MIT, pure Python and standard library only, so it adds
-nothing to build and nothing to install. `tools/check_vendored.py` confirms the
+nothing to build and nothing to install; only an LZFSE `.dmg` and an encrypted Apple
+disk image need an optional package, and the release executables carry the one for
+encrypted images. `tools/check_vendored.py` confirms the
 copy still matches what was vendored, and reports a copy it could not check
 separately from one that has drifted, because those are different results.
 
@@ -1081,6 +1093,8 @@ reported as not recognised, with its first bytes shown.
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
+| `--password-file FILE` | For an encrypted Apple disk image: a password, the first line of FILE. Repeatable |
+| `--password-env NAME` | For an encrypted Apple disk image: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
@@ -1363,7 +1377,9 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
-- **It does not decrypt.** A volume with encrypted filenames is flagged, not opened.
+- **It does not decrypt a filesystem.** An encrypted Apple disk image opens with its
+  password (above), because the encryption is the container's. A volume with encrypted
+  filenames is flagged, not opened.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
 - **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
