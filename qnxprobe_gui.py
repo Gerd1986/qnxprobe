@@ -136,12 +136,24 @@ def run_window(initial_paths):
                 images.insert("end", p)
         refresh_image_combo()
 
+    def add_folder():
+        # a folder that holds one image: an Apple sparse bundle, or an AFD. On a Mac
+        # the open dialog lists a .sparsebundle as one item and the folder dialog
+        # greys it out, so there it is added with Add...
+        p = filedialog.askdirectory(title="Sparse bundle or AFD folder")
+        if p:
+            p = os.path.normpath(os.path.abspath(p))
+            if p not in images.get(0, "end"):
+                images.insert("end", p)
+        refresh_image_combo()
+
     def remove_images():
         for i in reversed(images.curselection()):
             images.delete(i)
         refresh_image_combo()
 
     ttk.Button(btns, text="Add...", command=add_images).pack(fill="x")
+    ttk.Button(btns, text="Add folder...", command=add_folder).pack(fill="x", pady=(4, 0))
     ttk.Button(btns, text="Remove", command=remove_images).pack(fill="x", pady=(4, 0))
 
     # ---- options ----------------------------------------------------------

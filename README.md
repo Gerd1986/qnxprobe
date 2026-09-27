@@ -1017,13 +1017,20 @@ by its own first bytes rather than its name:
 | AFF | the `.aff` |
 | AFD, the folder of AFF files AFFLIB writes when an image is split | the `.afd` folder, or any `.aff` in it |
 | Apple disk image (UDIF), since 1.39 | the `.dmg` |
+| Apple disk image split by `hdiutil segment`, since 1.40 | the `.dmg`, with its `.dmgpart` files beside it |
 | Apple sparse image, since 1.39 | the `.sparseimage` |
+| Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
 
 A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
 has no trailer: it is the disk's bytes as they are, and has always been read as a raw
 image. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
 ewfprobe, and is refused, naming it, without. An encrypted Apple disk image is
-refused: it needs its password. Before 1.39 a `.dmg` or `.sparseimage` was read as raw
+refused: it needs its password, and so is an encrypted sparse bundle. A `.dmgpart` on
+its own is refused by the reader, which names the `.dmg` to open instead, and a split
+`.dmg` with a segment missing is refused rather than read short. A sparse bundle is
+recognised by its `Info.plist`, whatever the folder is called. Before 1.40 a sparse
+bundle stopped the run with a Python error (`IsADirectoryError`), and a split `.dmg`
+was refused. Before 1.39 a `.dmg` or `.sparseimage` was read as raw
 bytes; made from one test volume in every format `hdiutil` writes, the compressed ones
 (UDZO, UDBZ, ULMO, ULFO, UDCO), UDRO, the sparse image and an encrypted image all came
 back `not recognised`, and only the three that hold the disk's bytes in order (UDRW,
@@ -1336,7 +1343,8 @@ root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
 
 - **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
   is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, `.dmg`
-  or `.sparseimage` is read through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
+  (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle` is read
+  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01 and
   Lx01 logical evidence is refused, since it holds no disk. AFF4, AD1 and the other
   evidence containers are not decoded; such a file is read as plain raw bytes, so
   export the raw image from the imaging tool first. A segment set is joined only when it is whole from its first
