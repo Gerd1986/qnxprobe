@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.48"
+QNXPROBE_VERSION = "1.49"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -152,9 +152,9 @@ class ImagePasswordError(ImageUnreadable):
     with AD encryption, or an encrypted AFF) was opened without its password
     (``wrong`` is False) or with one that does not open it (``wrong`` is True). A
     caller that asks for the password can tell the two apart and ask again.
-    ``needs`` is "password", or "private key" for an AFF or an Apple disk image
-    sealed only to a certificate, which opens with that certificate's private key
-    instead."""
+    ``needs`` is "password", or "private key" for an AFF, an Apple disk image or an
+    AD-encrypted set sealed only to a certificate, which opens with that
+    certificate's private key instead."""
 
     def __init__(self, message, wrong, needs="password"):
         super().__init__(message)
@@ -363,18 +363,16 @@ def _ad1_first(path):
 
 
 def _opens_with(path):
-    """What an encrypted image opens with, "password" or "private key": always a
-    password for AD encryption; for an encrypted AFF or Apple disk image, found by
-    opening it with neither, since one sealed only to a certificate asks for its
-    private key instead. None for an image that is not encrypted, or that the reader
-    refuses for another reason (which opening it will then report)."""
+    """What an encrypted image opens with, "password" or "private key", found by
+    opening it with neither, since an AD-encrypted set, an encrypted AFF or an Apple
+    disk image sealed only to a certificate asks for its private key instead. None
+    for an image that is not encrypted, or that the reader refuses for another reason
+    (which opening it will then report)."""
     kind = acquisition_format(path)
-    if kind == "AD_ENCRYPTED":
-        return "password"
-    if kind not in ("AFF", "AFD", "DMG_ENCRYPTED"):
+    if kind not in ("AD_ENCRYPTED", "AFF", "AFD", "DMG_ENCRYPTED"):
         return None
     if ewfprobe is None:        # refused on opening, naming the missing reader
-        return "password" if kind == "DMG_ENCRYPTED" else None
+        return "password" if kind in ("AD_ENCRYPTED", "DMG_ENCRYPTED") else None
     try:
         ewfprobe.open_ewf(path).close()
     except ewfprobe.EwfPasswordRequiredError as exc:
@@ -673,8 +671,8 @@ def open_image(path, segments=None, password=None, private_key=None):
     caller already has it. password opens an encrypted Apple disk image, an
     acquisition FTK Imager encrypted with AD encryption or an encrypted AFF (a str,
     used as UTF-8, or bytes), and private_key (a path to, or the bytes of, an
-    unencrypted PEM or DER RSA key) an AFF or an Apple disk image sealed to a
-    certificate; without what
+    unencrypted PEM or DER RSA key) an AFF, an Apple disk image or an AD-encrypted set
+    sealed to a certificate; without what
     opens it, or with one that does not, ImagePasswordError is raised. Other
     images ignore both."""
     kind = acquisition_format(path)
@@ -13637,7 +13635,10 @@ def self_test():
                  "of its numbered files, and a plain numbered set is not one",
                  [acquisition_format(q) for q in (ad_first, ad_second, plain_second)]
                  == ["AD_ENCRYPTED", "AD_ENCRYPTED", None]
-                 and needs_password(ad_second) and not needs_password(plain_second)),
+                 and not needs_password(plain_second)
+                 # its header is only a signature, so the reader refuses it on opening
+                 # and nothing is asked for first
+                 and (saved_reader is None or not needs_password(ad_second))),
                 ("without the vendored reader an AD-encrypted set is refused, saying "
                  "what is missing",
                  "ewfprobe" in (_refusal(ad_second, None) or "")),
@@ -13646,7 +13647,8 @@ def self_test():
                  [acquisition_format(q) for q in (ad1_fake, ad1_second, ad1_enc,
                                                   ad1_enc_second, ad1_lone)]
                  == ["AD1", "AD1", "AD_ENCRYPTED", "AD_ENCRYPTED", None]
-                 and needs_password(ad1_enc_second) and not needs_password(ad1_second)),
+                 and not needs_password(ad1_second)
+                 and (saved_reader is None or not needs_password(ad1_enc_second))),
                 ("an AD1 is refused as FTK Imager logical evidence, with or without "
                  "the reader",
                  all("FTK Imager logical evidence" in (_refusal(q, r) or "")
@@ -14027,10 +14029,17 @@ def self_test():
                 except ImagePasswordError as exc:
                     return "wrong" if exc.wrong else "required"
 
+            globals()["ewfprobe"] = None            # without the reader, as before 1.49:
+            try:                                    # ask for the password, then refuse
+                ad_asks_without_reader = needs_password(ad_paths[1])
+            finally:
+                globals()["ewfprobe"] = saved_reader
             for label, cond in (
                     ("an AD-encrypted raw set opens from its second file with its "
                      "password and reads the disk across both files",
-                     _ad_opened_with([enc_password]) is True),
+                     _ad_opened_with([enc_password]) is True
+                     and needs_password(ad_paths[1]) and not needs_private_key(ad_paths[1])
+                     and ad_asks_without_reader),
                     ("without its password it is refused as needing one, and with a "
                      "wrong one as a wrong one",
                      _ad_opened_with([]) == "required"
@@ -14038,6 +14047,55 @@ def self_test():
                 if not cond:
                     ok = False
                 print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
+
+            # The same set sealed to a certificate as FTK Imager seals one: the salt
+            # wrapped with the RSA public key (PKCS#1 v1.5), one RSA block, and the key
+            # made from the empty password rather than a password's hash.
+            ad_rsa = getattr(saved_reader, "_RSA", None)
+            ad_pkcs1 = getattr(saved_reader, "_PKCS1", None)
+            if ad_rsa is None or ad_pkcs1 is None:
+                print("  [SKIP] an AD-encrypted set sealed to a certificate opens with its "
+                      "private key (needs the pycryptodome package)")
+            else:
+                ad_sealer, ad_stranger = ad_rsa.generate(1024), ad_rsa.generate(1024)
+                sealed_made = hashlib.pbkdf2_hmac("sha1", b"", ad_salt, 1000, 32)
+                sealed_wrapped = _ctr(sealed_made, ad_key, 0)
+                sealed_salt = ad_pkcs1.new(ad_sealer.publickey()).encrypt(ad_salt)
+                sealed_head = (struct.pack("<8sIIhhh2sIIIIII", b"ADCRYPT\x00", 1, 512,
+                                           -1, -1, -1, b"\x00\x00", 3, 2, 1000,
+                                           len(sealed_salt), 32, 64)
+                               + sealed_salt + sealed_wrapped
+                               + hmac.new(sealed_made, sealed_wrapped, "sha512").digest())
+                sealed_paths = [os.path.join(d, "ad_sealed.0001"),
+                                os.path.join(d, "ad_sealed.0002")]
+                with open(sealed_paths[0], "wb") as fh:
+                    fh.write(sealed_head.ljust(512, b"\0") + _ctr(ad_key, ad_disk[:2048], 0))
+                with open(sealed_paths[1], "wb") as fh:
+                    fh.write(_ctr(ad_key, ad_disk[2048:], 1 << 64))
+
+                def _ad_sealed(keys, passwords=()):
+                    try:
+                        with open_image_trying(sealed_paths[1], None, passwords,
+                                               keys) as handle:
+                            handle.seek(0)
+                            return handle.read(len(ad_disk) + 1) == ad_disk
+                    except ImagePasswordError as exc:
+                        return ("wrong" if exc.wrong else "required", exc.needs)
+
+                for label, cond in (
+                        ("an AD-encrypted set sealed to a certificate needs its private "
+                         "key, not a password, and opens with it, the first of several "
+                         "that does",
+                         needs_private_key(sealed_paths[0])
+                         and not needs_password(sealed_paths[0])
+                         and _ad_sealed([]) == ("required", "private key")
+                         and _ad_sealed([], ["a password"]) == ("required", "private key")
+                         and _ad_sealed([ad_stranger.export_key()]) == ("wrong", "password")
+                         and _ad_sealed([ad_stranger.export_key(),
+                                         ad_sealer.export_key()]) is True),):
+                    if not cond:
+                        ok = False
+                    print(f"  [{'PASS' if cond else 'FAIL'}] {label}")
 
         # ---- APFS ----------------------------------------------------
         # A container superblock built by hand, so identification is tested
@@ -16826,8 +16884,8 @@ if __name__ == "__main__":
                     help="a BitLocker startup key (a .BEK file), tried against every "
                          "BitLocker volume. Repeatable")
     ap.add_argument("--private-key", metavar="FILE", action="append", default=[],
-                    help="for an AFF or an Apple disk image sealed to a certificate: the "
-                         "certificate's RSA "
+                    help="for an AFF, an Apple disk image or an AD-encrypted set sealed "
+                         "to a certificate: the certificate's RSA "
                          "private key, unencrypted, as PEM or DER. Repeatable; each "
                          "image opens with the first one that opens it")
     ap.add_argument("--version", action="version",

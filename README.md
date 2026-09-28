@@ -1128,6 +1128,7 @@ by its own first bytes rather than its name:
 | any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
 | any of the Apple images above sealed to a certificate, since 1.48 | the same, with `--private-key` (the certificate's RSA private key), or its password when it also has one |
 | an E01, SMART or raw (dd) set FTK Imager encrypted with AD encryption, since 1.42 | the first file (`.E01`, `.s01`), or any `.001`, `.002`, ... of a raw set, with its password |
+| such a set sealed to a certificate instead of a password, since 1.49 | the same, with `--private-key` (the certificate's RSA private key) |
 | AFF4 (standard v1.0 or Evimetry's pre-standard layout), since 1.44 | the `.aff4`, or any file of one striped across several, with the others beside it |
 | VHD, fixed, dynamic or differencing, since 1.46 | the `.vhd`; a differencing one with its parent beside it or where it names |
 | VHDX, fixed, dynamic or differencing, since 1.46 | the `.vhdx`, likewise |
@@ -1188,6 +1189,13 @@ opens the same way, with that certificate's RSA private key; one that also has a
 password opens with either. Before 1.48 an image sealed only to a certificate was
 refused whatever was given. An image whose key is kept in a keybag is still refused,
 naming it.
+
+Since 1.49 an E01, SMART, raw or AD1 set FTK Imager sealed to a certificate with AD
+encryption opens the same way, with that certificate's RSA private key; before 1.49 it
+was refused as needing a password it could not use. An AD1 inside is still refused as
+logical evidence. `needs_password` and `needs_private_key` now ask the reader for an
+AD-encrypted set too, so one whose header is damaged is refused on opening rather than
+asking for a password first.
 
 Since 1.46 the disks virtual machines keep are read the same way: Microsoft's VHD and
 VHDX, VMware's VMDK and QEMU's QCOW, each recognised by its own bytes (a VHD by the footer at its end
@@ -1252,7 +1260,7 @@ reported as not recognised, with its first bytes shown.
 | `--password-file FILE` | For an encrypted image (an Apple disk image, an AD-encrypted FTK Imager acquisition or an encrypted AFF) or a BitLocker volume: a password or recovery password, the first line of FILE. Repeatable |
 | `--password-env NAME` | For an encrypted image or a BitLocker volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
 | `--bitlocker-key FILE` | A BitLocker startup key (a `.BEK` file), tried against every BitLocker volume. Repeatable |
-| `--private-key FILE` | For an AFF or an Apple disk image sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
+| `--private-key FILE` | For an AFF, an Apple disk image or an AD-encrypted set sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
 | `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
 | `--version` | Print the version |
