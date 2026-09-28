@@ -184,8 +184,9 @@ def run_window(initial_paths):
     def unlock_volumes(path):
         """Ask for the key of each BitLocker volume in the image that the keys kept so
         far do not open: a password or recovery password, or, left empty, a startup
-        key (.BEK) file. A cancelled prompt leaves that volume locked. Keys are kept
-        in memory for this window only. False when the image cannot be read."""
+        key (.BEK) file; then the password of each encrypted APFS volume they do not
+        open. A cancelled prompt leaves that volume locked. Keys are kept in memory
+        for this window only. False when the image cannot be read."""
         secrets = state["bl_secrets"].setdefault(path, [])
         keys = state["bl_keys"].setdefault(path, [])
         try:
@@ -215,6 +216,24 @@ def run_window(initial_paths):
                         elif bl.unlock([answer], ()):
                             secrets.append(answer)
                         wrong = bl.fvek is None
+                # an encrypted APFS volume whose blocks are ciphertext: its password
+                # or personal recovery key, with the hint it stores when it has one
+                _fh, afound = q.unlock_apfs(fh, q.image_size(fh), secrets)
+                for lk in afound:
+                    wrong = False
+                    while lk.vek is None and not lk.why:
+                        prompt = (("That does not open it. " if wrong else "")
+                                  + f"{lk.name} in {lk.label} of "
+                                  f"{os.path.basename(os.path.normpath(path))} is an encrypted "
+                                  f"APFS volume. Its password or personal recovery key"
+                                  + (f' (its hint, as stored: "{lk.hint}")' if lk.hint else "")
+                                  + ":")
+                        answer = simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
+                        if not answer:
+                            break
+                        if lk.unlock([answer]):
+                            secrets.append(answer)
+                        wrong = lk.vek is None
         except Exception as exc:            # pylint: disable=broad-exception-caught
             messagebox.showerror("qnxprobe", f"could not read {path}:\n{exc}")
             return False
@@ -543,7 +562,7 @@ def run_window(initial_paths):
         if not unlock(path):                 # an encrypted image, its password refused
             done_loading()
             return
-        if not unlock_volumes(path):         # a BitLocker volume's key asked for
+        if not unlock_volumes(path):         # a BitLocker or APFS volume's key asked for
             done_loading()
             return
 
@@ -556,6 +575,8 @@ def run_window(initial_paths):
                 fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
                                                 state["bl_secrets"].get(path, []),
                                                 state["bl_keys"].get(path, []))
+                fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
+                                            state["bl_secrets"].get(path, []))
                 q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
