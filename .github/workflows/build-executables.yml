@@ -113,6 +113,7 @@ jobs:
           assert "[PASS] an AD-encrypted raw set opens from its second file" in r.stdout, "no AD leg"
           # and its RSA modules, so an image sealed to a certificate opens with the key
           assert "[PASS] an image sealed only to a certificate needs its private key" in r.stdout, "no RSA"
+          assert "[PASS] an AD-encrypted set sealed to a certificate needs its private key" in r.stdout, "no AD RSA"
           # and the vendored reader reads a virtual disk from inside the executable
           assert "[PASS] a hand-built fixed and dynamic VHD are named VHD" in r.stdout, "no VHD leg"
 
