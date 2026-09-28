@@ -424,8 +424,10 @@ such volume), and is then listed and extracted like any other. The report marks 
 `encrypted, opened with a password`, and the note says so. Without a key that opens it,
 it stays `encrypted and locked, not read`, and the note says what would open it and gives
 the passphrase hint the volume stores, as stored. The window asks for each locked
-volume's password when it loads an image, showing the hint. From 1.44 to 1.49 such a
-volume was named locked and not walked.
+volume's password when it loads an image, showing the hint. A file listed while its
+volume was open and asked for again once it is locked (a later session, without the key)
+is refused with `ApfsUnreadable`, never read back as an empty file. From 1.44 to 1.49
+such a volume was named locked and not walked.
 
 This is the software encryption Apple File System Reference (2020-06-22) describes in
 "Encryption" and "Accessing Encrypted Objects", which a Mac uses for external storage and
