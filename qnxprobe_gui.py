@@ -135,7 +135,7 @@ def run_window(initial_paths):
         return simpledialog.askstring("qnxprobe", prompt, show="*", parent=root)
 
     def unlock_key(path):
-        """Ask for the private key file of an AFF sealed to a certificate until one
+        """Ask for the private key file of an image sealed to a certificate until one
         opens it, and keep its path; True when kept (or not needed), False when the
         examiner cancels."""
         if path in state["aff_keys"] or not q.needs_private_key(path):
