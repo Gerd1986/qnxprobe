@@ -8,7 +8,8 @@
 # 1,100 MB because APFS allows one volume per 512 MiB of container; the sparse
 # image holds only what was written.
 #
-# The passphrase is a test value made for this fixture; qnxprobe never takes one.
+# The passphrase is a test value made for this fixture, and the self-test opens the
+# encrypted volume with it as well as reading it locked without it.
 #
 #     bash tools/make_apfs_encrypted_fixture.sh tests/fixtures
 set -euo pipefail

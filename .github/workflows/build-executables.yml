@@ -189,6 +189,36 @@ jobs:
               print(f"{label}: {match} of {len(want)} files from the BitLocker volume match their source hashes")
               assert match == len(want) == 612
 
+      - name: Check the command line executable opens an encrypted APFS volume
+        shell: python
+        run: |
+          # Proves the build carries what opening an APFS volume with its password
+          # needs (PBKDF2 from hashlib, AES-ECB for the key unwrap and for XTS),
+          # which the frozen self-test cannot show: the APFS fixtures are not beside
+          # the executable. The password is the fixture's test value, given by file.
+          import gzip, hashlib, os, shutil, subprocess, zipfile
+          ext = ".exe" if os.name == "nt" else ""
+          cli = os.path.join("dist", "qnxprobe" + ext)
+          with gzip.open("tests/fixtures/apfs-converted.sparseimage.gz") as src, \
+                  open("apfs.sparseimage", "wb") as dst:
+              shutil.copyfileobj(src, dst)
+          with open("apfs-password.txt", "w", encoding="utf-8") as fh:
+              fh.write("qnxprobe-apfs-convert\n")
+          want = {}
+          with open("tests/fixtures/apfs-converted.sha256", encoding="utf-8") as fh:
+              for line in fh:
+                  digest, path = line.rstrip("\n").split("  ", 1)
+                  want["p1_lba40_disk_image/CONVVOL/" + path] = digest
+          r = subprocess.run([cli, "--password-file", "apfs-password.txt", "--extract",
+                              "apfs.zip", "apfs.sparseimage"], capture_output=True, text=True)
+          print(r.stdout[-500:]); assert r.returncode == 0, r.stderr[-2000:]
+          assert "encrypted, opened with a password" in r.stdout, "not opened with a password"
+          with zipfile.ZipFile("apfs.zip") as z:
+              got = {n: hashlib.sha256(z.read(n)).hexdigest() for n in z.namelist() if n in want}
+          match = sum(1 for n, d in want.items() if got.get(n) == d)
+          print(f"{match} of {len(want)} files from the encrypted APFS volume match what macOS recorded")
+          assert match == len(want) == 3
+
       - name: Check the window starts and stays up
         shell: python
         run: |

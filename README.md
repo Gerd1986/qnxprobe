@@ -51,6 +51,11 @@ It also opens BitLocker volumes with their password, recovery password or startu
 (`.BEK`) file, and reads the NTFS, FAT32 or exFAT inside them; without a key it names
 the volume, its protectors and what would open it. See [BitLocker](#bitlocker).
 
+It also opens an APFS volume macOS encrypted in software (an external drive, or a Mac
+without a T2 chip or Apple silicon) with its password or personal recovery key; without
+one it names the volume, says what would open it and gives the passphrase hint the volume
+stores. See [Opening an encrypted APFS volume](#opening-an-encrypted-apfs-volume).
+
 It also reads the filesystems embedded Linux keeps on flash: SquashFS, JFFS2, UBI and the
 UBIFS inside it, and YAFFS1 and YAFFS2. They are what routers, cameras, drones and Linux
 head units tend to carry, often as a chip dump with no partition table and sometimes with
@@ -382,10 +387,11 @@ directory records, inodes and their extended fields, file extents including spar
 ones, symbolic links, and files compressed with the `decmpfs` attribute in its zlib
 forms.
 
-What it does not do: an encrypted volume whose blocks are ciphertext in the image is
-named, marked `encrypted and locked, not read`, and not walked, and a file compressed
-with LZVN or LZFSE is listed with its size and refuses to be read. Nothing here reads a
-snapshot: what is walked is the volume as the newest checkpoint leaves it.
+What it does not do: an encrypted volume whose blocks are ciphertext in the image, and
+which no password given opens (see below), is named, marked `encrypted and locked, not
+read`, and not walked, and a file compressed with LZVN or LZFSE is listed with its size
+and refuses to be read. Nothing here reads a snapshot: what is walked is the volume as
+the newest checkpoint leaves it.
 
 An encrypted volume is one whose flags lack `APFS_FS_UNENCRYPTED` (Apple File System
 Reference, 2020-06-22, `apfs_superblock_t` and "Volume Flags"). Whether its blocks are
@@ -408,6 +414,78 @@ encrypted one must be named locked with its tree never parsed. The in-the-clear 
 built from the plain fixture by clearing the flag and sealing the superblock's
 checksum again, and must read every entry; with the tree's root node replaced by noise,
 the same volume must read as locked.
+
+### Opening an encrypted APFS volume
+
+Since 1.50 an encrypted APFS volume whose blocks are ciphertext in the image opens with
+its password or its personal recovery key, given the way any password is
+(`--password-file FILE` or `--password-env NAME`, repeatable, each tried against every
+such volume), and is then listed and extracted like any other. The report marks it
+`encrypted, opened with a password`, and the note says so. Without a key that opens it,
+it stays `encrypted and locked, not read`, and the note says what would open it and gives
+the passphrase hint the volume stores, as stored. The window asks for each locked
+volume's password when it loads an image, showing the hint. From 1.44 to 1.49 such a
+volume was named locked and not walked.
+
+This is the software encryption Apple File System Reference (2020-06-22) describes in
+"Encryption" and "Accessing Encrypted Objects", which a Mac uses for external storage and
+for internal storage without hardware encryption. The password, through PBKDF2 with the
+salt and iteration count its unlock record carries, unwraps the key encryption key
+(RFC 3394); that unwraps the volume key; and the volume key decrypts the volume's tree and
+files as AES-XTS. Two details come from libfsapfs's format notes and code at commit
+`f63c83b462275214fc5e4b0919540d892f50b467` rather than from Apple's reference: each keybag
+is itself AES-XTS encrypted with its container's or volume's identifier as both keys (the
+reference says RFC 3394 for that step; the keybags on both test volumes do not unwrap as
+RFC 3394 and do read as AES-XTS), and a file's data is decrypted from its extent's
+`crypto_id`, not from the block it sits in now (`libfsapfs_file_system_data_handle.c`,
+lines 274 to 307). PBKDF2 is HMAC-SHA256, which is what unwraps the key on both test
+volumes. It needs the optional
+`pycryptodome` package, and says so without it.
+
+Not read, and named in the note: a volume whose files use per-file keys (Apple's reference
+ties those to hardware encryption), a volume that was being encrypted, decrypted or given
+a new key when it was imaged (its blocks are then not all in one state), an unlock
+record in the CoreStorage-compatible form (libfsapfs: flag 0x2, AES-128), and an
+institutional recovery key. The internal storage of a Mac with a T2 chip or Apple silicon
+does not open with a password from an image: Apple Platform Security's
+[FileVault page](https://support.apple.com/guide/security/volume-encryption-with-filevault-sec4c6dc1b6e/web)
+says its key encryption key "is protected by a combination of the user's password and
+hardware UID". An acquisition made through such a Mac's own decryption holds the volume
+in the clear, and is read as described above.
+
+From Python, after `unlock_bitlocker()` if the image may hold BitLocker too:
+
+```python
+image = q.open_image(path)
+image, found = q.unlock_apfs(image, passwords=[password])
+for vol in q.volumes(image):
+    print(vol["kind"], vol.get("note", ""))
+```
+
+`unlock_apfs()` returns the image carrying the keys it derived, so every `ApfsWalker`
+made over it (and so `volumes()`, `walk_all()` and every extraction) reads those volumes
+decrypted, and one `ApfsLock` per such volume, opened or not, with `name`, `hint`,
+`unlocked_by` (`password` or `personal recovery key`), `why` (what stops it being opened
+at all) and `locked_note()`.
+
+Checked on two volumes macOS 26 encrypted, which ship gzipped under `tests/fixtures`:
+one encrypted as it was made (`tools/make_apfs_encrypted_fixture.sh`) and one encrypted in
+place after files were written, with a passphrase hint
+(`tools/make_apfs_converted_fixture.sh`). The self-test requires every file on both to
+match what macOS wrote, a wrong password to leave the volume locked with its tree never
+parsed, and the hint to be reported as stored. On every extent record of both volumes
+(5 and 6) `crypto_id` equals the extent's block, so the self-test also moves one extent of a copy to
+another block, as a container shrink would, and requires it to read the same; a reader
+that took the tweak from the block fails there. It refuses copies built with each of the
+shapes named above as not read. A personal recovery key goes through the same steps as a
+password in Apple's reference; no volume carrying one was available to test.
+
+Decryption is the same pure-Python AES-XTS the BitLocker reader uses, about 95 MB/s on an
+Apple M2 Max. Since 1.50 a file is also read in one pass over its extents: before, each
+megabyte of a file read its whole data again, so the largest file of the APFS fixture
+below, 12,288,000 bytes, took 148,840,448 bytes of reads and now takes 12,500,992.
+
+### Checked against The Sleuth Kit
 
 Validated against The Sleuth Kit's APFS support, an entirely separate implementation.
 A 32 MiB container written by macOS itself and populated through its own driver ships
@@ -1257,8 +1335,8 @@ reported as not recognised, with its first bytes shown.
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
-| `--password-file FILE` | For an encrypted image (an Apple disk image, an AD-encrypted FTK Imager acquisition or an encrypted AFF) or a BitLocker volume: a password or recovery password, the first line of FILE. Repeatable |
-| `--password-env NAME` | For an encrypted image or a BitLocker volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
+| `--password-file FILE` | For an encrypted image (an Apple disk image, an AD-encrypted FTK Imager acquisition or an encrypted AFF), a BitLocker volume or an encrypted APFS volume: a password or recovery password (for APFS, the personal recovery key), the first line of FILE. Repeatable |
+| `--password-env NAME` | For an encrypted image, a BitLocker volume or an encrypted APFS volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
 | `--bitlocker-key FILE` | A BitLocker startup key (a `.BEK` file), tried against every BitLocker volume. Repeatable |
 | `--private-key FILE` | For an AFF, an Apple disk image or an AD-encrypted set sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
 | `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
@@ -1560,12 +1638,13 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
   Becker HBCIFS container are recognised and reported but not decompressed, because no
   sample exists to validate a reader against. A big-endian IFS is declined the same way.
   In each case the header is still reported and the walk is declined out loud.
-- **It decrypts BitLocker, not a filesystem's own encryption.** An encrypted Apple disk
-  image or an AD-encrypted acquisition opens with its password, and a BitLocker volume
-  with its key (above), because that encryption wraps the whole volume. An encrypted APFS
-  volume whose blocks are ciphertext in the image, an NTFS file encrypted on its own, and
-  a volume with encrypted filenames are flagged, not opened; an APFS volume the image
-  holds decrypted is read (see APFS above). A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
+- **It decrypts BitLocker and APFS volume encryption, not per-file encryption.** An
+  encrypted Apple disk image or an AD-encrypted acquisition opens with its password, a
+  BitLocker volume with its key, and an APFS volume macOS encrypted in software with its
+  password or personal recovery key (above). An APFS volume with per-file keys, one that
+  was mid-way through being encrypted, an NTFS file encrypted on its own, and a volume
+  with encrypted filenames are flagged, not opened; an APFS volume the image holds
+  decrypted is read (see APFS above). A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
