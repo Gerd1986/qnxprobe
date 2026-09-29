@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.52"
+QNXPROBE_VERSION = "1.53"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -9798,7 +9798,7 @@ class ProgressEmitter:
         self.stream.flush()
 
 
-def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=False):
+def extract_to_zip(zf, w, volume, entries, log, progress=None):
     """Stream each regular file into the open zipfile. Returns a tally.
 
     Returns (files, written, skipped, failed, short). progress, when given, is
@@ -9810,12 +9810,17 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=Fals
     A file whose blocks lie past the end of the image is a SHORT read: read_at()
     answers a seek past the end of the file with empty bytes, so the walker
     hands back fewer bytes than the inode says and raises nothing. Such a file
-    is counted in short, not in files, and logged. With may_be_short, which the
-    caller passes when it already knows this volume reaches past the end of the
-    image, each file is spooled before it is written so a short one can be
-    stored under a name that says how much of it is here. On a volume with no
-    reason to expect it the file streams straight into the zip; a short one
-    then keeps its name, and the count and the log still say it was short.
+    is counted in short, not in files, and logged, and it is stored under a name
+    that says how much of it is here: <path>.SHORT-<got>-of-<size>-bytes.
+
+    Each file is read in full into a spool before anything is written, because
+    zipfile cannot remove a member once it is written. A file whose read raises
+    partway is therefore left out of the zip entirely, counted in failed and
+    logged with the reason; streaming it would have left a member holding only
+    the bytes read so far under the file's real name, which a reader of the zip
+    cannot tell from an ordinary, shorter file. The spool stays in memory up to
+    32 MiB and moves to a temporary file above that, so a larger file is written
+    to disk twice and needs its own size free in the temporary folder.
     """
     import shutil
     import tempfile
@@ -9833,23 +9838,17 @@ def extract_to_zip(zf, w, volume, entries, log, progress=None, may_be_short=Fals
             info.external_attr = 0o100644 << 16
             got = 0
             before = EOF_SHORTFALL["bytes"]
-            if may_be_short:
-                with tempfile.SpooledTemporaryFile(max_size=32 << 20) as spool:
-                    for chunk in w.read_file(ino, size):
-                        spool.write(chunk)
-                        got += len(chunk)
-                    got = min(got, max(size - (EOF_SHORTFALL["bytes"] - before), 0))
-                    if got < size:
-                        info.filename = f"{arc}.SHORT-{got}-of-{size}-bytes"
-                    spool.seek(0)
-                    with zf.open(info, "w") as dst:
-                        shutil.copyfileobj(spool, dst)
-            else:
-                with zf.open(info, "w") as dst:
-                    for chunk in w.read_file(ino, size):
-                        dst.write(chunk)
-                        got += len(chunk)
+            with tempfile.SpooledTemporaryFile(max_size=32 << 20) as spool:
+                for chunk in w.read_file(ino, size):
+                    spool.write(chunk)
+                    got += len(chunk)
+                # Only now, with the whole file read, does anything reach the zip.
                 got = min(got, max(size - (EOF_SHORTFALL["bytes"] - before), 0))
+                if got < size:
+                    info.filename = f"{arc}.SHORT-{got}-of-{size}-bytes"
+                spool.seek(0)
+                with zf.open(info, "w") as dst:
+                    shutil.copyfileobj(spool, dst)
             # A walker pads a block the image ends inside with zeros, so the bytes
             # it handed back are not the bytes that were there; the shortfall
             # read_at() tallied while this file was read is.
@@ -12066,8 +12065,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     ents, dropped = apply_exclude(ents, exclude)
                     log = []
                     miss = missing_past_end(base, base + total)
-                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                            may_be_short=bool(miss))
+                    f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                     if manifest is not None:
                         rsize = next((r[2] for r in sized_regions if r[1] == base), None)
                         manifest.append({
@@ -12181,8 +12179,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                         ents, dropped = apply_exclude(ents, exclude)
                         log = []
                         miss = missing_past_end(b)
-                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                may_be_short=bool(miss))
+                        f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                         if manifest is not None:
                             _u = read_at(fh, b + EXT_SB_OFF, 1024)
                             manifest.append({
@@ -12229,8 +12226,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                             ents, dropped = apply_exclude(ents, exclude)
                             log = []
                             miss = missing_past_end(b)
-                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                    may_be_short=bool(miss))
+                            f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                             if manifest is not None:
                                 manifest.append({
                                     "volume": vol, **image_rec,
@@ -12283,8 +12279,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                                 ents, dropped = apply_exclude(ents, exclude)
                                 log = []
                                 miss = missing_past_end(b)
-                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter,
-                                                                        may_be_short=bool(miss))
+                                f_, wr, sk, fa, sh = extract_to_zip(zf, w, vol, ents, log, reporter)
                                 if manifest is not None:
                                     manifest.append({
                                         "volume": vol, **image_rec,
@@ -16785,6 +16780,84 @@ def self_test():
                   f"repaired of {len(ub_want_rep)} expected; the node with two bits flipped is "
                   f"refused ({ub_bad.get(ub_path_c, 'NOT REFUSED')}), and the erased one "
                   f"({ub_bad.get(ub_path_d, 'NOT REFUSED')})" + ub_broke)
+
+        # A file whose read fails partway must not reach the zip. zipfile cannot
+        # take a member back once it is written, and until 1.53 a file on a volume
+        # not expected to be short was streamed straight in, so an error after the
+        # first block left a member holding only the bytes read so far under the
+        # file's real name. Here many_blocks.txt's block 1 is erased in the UBIFS
+        # fixture and the image is extracted the way --extract does it: that file
+        # must be absent, under its own name or any other, and counted as failed,
+        # and the zip must hold every other file, matching the source hashes, and
+        # the manifest, and nothing else.
+        pe_fx = os.path.join(fx, "ubifs-lzo.img.gz")
+        pe_src = os.path.join(fx, "ubifs.src.sha256")
+        if os.path.isfile(pe_fx) and os.path.isfile(pe_src):
+            import hashlib as _hl_pe          # pylint: disable=import-outside-toplevel
+            with gzip.open(pe_fx, "rb") as gz:
+                pe_img = bytearray(gz.read())
+            pe_w0 = UbifsWalker(io.BytesIO(bytes(pe_img)), 0)
+            pe_target = "dir/many_blocks.txt"
+            pe_ino = next((n_ for p_, n_, *_x in walk_all(pe_w0) if p_ == pe_target), None)
+            pe_blocks = pe_w0.data.get(pe_ino, {})
+            pe_detail = ""
+            pe_cond = pe_ino is not None and len(pe_blocks) >= 3 and 1 in pe_blocks
+            if pe_cond:
+                pe_ln, pe_of = pe_blocks[1][0], pe_blocks[1][1]
+                pe_at = pe_ln * pe_w0.leb_size + pe_of
+                pe_img[pe_at:pe_at + 4] = b"\xff" * 4
+                # Both files are removed again: CI keeps the *.img files this
+                # function leaves behind as fixtures for the executables, and
+                # counts them.
+                pe_path = os.path.join(d, "ubifs_block1_erased.img")
+                pe_zip = os.path.join(d, "ubifs_block1_erased.zip")
+                pe_man = []
+                pe_buf = io.StringIO()
+                pe_want = {}
+                pe_leaked, pe_ok, pe_bad = [], 0, 0
+                try:
+                    with open(pe_path, "wb") as pe_fh:
+                        pe_fh.write(bytes(pe_img))
+                    with zipfile.ZipFile(pe_zip, "w") as zf, contextlib.redirect_stdout(pe_buf):
+                        main(pe_path, extract=pe_zip, zf=zf, manifest=pe_man)
+                    with open(pe_src, encoding="utf-8") as pe_hf:
+                        for pe_line in pe_hf:
+                            if pe_line.strip():
+                                pe_dg, pe_p = pe_line.rstrip("\n").split("  ", 1)
+                                pe_want[pe_p] = pe_dg
+                    with zipfile.ZipFile(pe_zip) as pe_zr:
+                        pe_members = {i_.filename: i_ for i_ in pe_zr.infolist()}
+                        # anything but the other files and the manifest: the damaged
+                        # file under its own name, a marker, or a stray
+                        pe_leaked = sorted(set(pe_members) - {"volumes.json"}
+                                           - {f"lba0/{p_}" for p_ in pe_want if p_ != pe_target})
+                        for pe_p, pe_dg in pe_want.items():
+                            if pe_p == pe_target:
+                                continue
+                            pe_i = pe_members.get(f"lba0/{pe_p}")
+                            if (pe_i is not None and
+                                    _hl_pe.sha256(pe_zr.read(pe_i)).hexdigest() == pe_dg):
+                                pe_ok += 1
+                            else:
+                                pe_bad += 1
+                finally:
+                    for pe_rm in (pe_path, pe_zip):
+                        if os.path.exists(pe_rm):
+                            os.remove(pe_rm)
+                pe_entry = pe_man[0] if pe_man else {}
+                pe_cond = (not pe_leaked and pe_bad == 0 and pe_ok == len(pe_want) - 1
+                           and pe_entry.get("failed") == 1
+                           and f"could not extract lba0/{pe_target}" in pe_buf.getvalue()
+                           and "is erased flash" in pe_buf.getvalue())
+                pe_detail = (f"{pe_ok} of {len(pe_want) - 1} other files match their source hash, "
+                             f"{pe_entry.get('failed')} failed, other members: "
+                             f"{pe_leaked or 'none'}")
+            else:
+                pe_detail = f"{pe_target} not found with a block 1 in the fixture"
+            if not pe_cond:
+                ok = False
+            print(f"  [{'PASS' if pe_cond else 'FAIL'}] a file whose read fails partway is left "
+                  f"out of the zip, not stored with the bytes read so far ({pe_detail})")
 
         # CRC32_ONE_BIT_MAX rests on the shortest weight-3 codeword of CRC-32
         # (x^a + x^b + 1 divisible by 0x104C11DB7): found here, not assumed.

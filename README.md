@@ -234,7 +234,8 @@ bytes on most disks, and 4096 on a disk whose GPT header sits at byte 4096, as o
 
 The zip also carries `volumes.json`: per volume, the LBA and the sector size it
 counts in (`sector_bytes`), byte offset, partition size, filesystem type, the recorded volume id or UUID, and what was extracted,
-including `short` (files whose blocks reach past the end of the image) and, on a
+including `short` (files whose blocks reach past the end of the image), `failed`
+(files that could not be read, which are not in the zip) and, on a
 volume that does, `extends_past_image_by_bytes`. On a split image `image` names the
 first segment and `image_segments` lists every segment joined, with its byte count;
 on a virtual disk read over a parent, `image_parents` lists each parent's files, nearest
@@ -295,6 +296,21 @@ by name, when the rest lives in an extended attribute this does not read.
 
 The zip `--extract` produces is what a LEAPP tool ingests, so this replaces the mount
 and the manual zip in one step. `--exclude` is repeatable.
+
+Each file is read in full before anything of it is written to the zip, because a zip
+member cannot be taken back once written. A file whose read raises partway (in the
+self-test, a UBIFS data node that reads as erased flash) is left out of the zip
+entirely: the report counts it as `FAILED` and prints
+`could not extract <path>: <reason>` for the first five on each volume, and
+`volumes.json` counts it under `failed`.
+There is no member for it, under its own name or a marker. Before 1.53 such a file
+could reach the zip holding only the bytes read before the error, under its real
+name, where it looked like an ordinary, shorter file. A file whose blocks reach past
+the end of the image is still stored, under a name ending
+`.SHORT-<here>-of-<size>-bytes` (see "What it does not do"), and since 1.53 that name
+is given on every volume, not only on one the partition table already shows is cut.
+A file larger than 32 MiB is held in a temporary file while it is read, so extraction
+needs that file's size free in the system's temporary folder.
 
 ## Reading an image from Python
 
