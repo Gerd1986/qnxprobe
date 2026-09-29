@@ -11388,13 +11388,14 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # Configuration stores on flash
 #
 # A flash chip also carries name=value stores that are not filesystems: the
-# U-Boot environment, and on Belkin WeMo devices Belkin's libnvram store.
+# U-Boot environment, and on Belkin WeMo devices Belkin's libnvram store. The
+# report names a store by its layout, which does not say which program wrote it.
 # Neither has a directory, so each is given as a volume holding one file, the
 # store's bytes as they sit on the chip, for a consumer to parse. Both are
 # accepted only on a CRC-32 that holds over the store, and a store's size is the
 # one its CRC holds for, tried in 4 KiB steps up to CFG_STORE_MAX.
 #
-# U-Boot environment, env_t in include/env_internal.h at v2024.01
+# U-Boot's environment layout, env_t in include/env_internal.h at v2024.01
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86):
 # a little-endian CRC-32, a flags byte only when the board keeps a redundant copy
 # (ENV_HEADER_SIZE, lines 59-61), then CONFIG_ENV_SIZE less that header of
@@ -11523,7 +11524,8 @@ def identify_uboot_env(fh, base, size):
     layout = ("a 4-byte header, the single-copy layout" if hdr == 4 else
               f"a 5-byte header, the redundant-copy layout (flags byte {flags})")
     return "uboot-env", [
-        "format       U-Boot environment, CRC-32 holds",
+        "format       U-Boot's environment layout (env_t), CRC-32 holds; the layout "
+        "does not say which program wrote the store",
         f"store        {human(n)}, {layout}, {len(strings)} name=value strings",
         "file         uboot-env.bin, the store's bytes as held on flash"]
 

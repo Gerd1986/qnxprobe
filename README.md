@@ -1160,7 +1160,8 @@ filesystems: the U-Boot environment, and the libnvram store Belkin WeMo devices 
 opens with `NVRM`. Neither is a filesystem, so each is reported as a volume holding one
 file, `uboot-env.bin` or `nvram.bin`: the store's bytes as held on flash, for a consumer to
 parse. The report gives a store's layout and how many name=value strings it holds, never
-their values. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
+their values. A store is named by its layout, and the layout does not say which program wrote
+it. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
 steps up to 256 KiB, and a U-Boot environment only when its first string opens with a name
 and `=` and its strings end inside it. A store sits in its own MTD partition, so a JFFS2 in
 front of one ends where it begins. A partition or a file is taken for a store when the store
