@@ -62,7 +62,9 @@ head units tend to carry, often as a chip dump with no partition table and somet
 the NAND spare bytes still between the pages. Each is found by its own headers inside such
 a dump and read the way the Linux kernel (for YAFFS, Aleph One's own code) reads it. LZO
 and LZ4, which the standard library lacks, are carried as small pure-Python decoders. See
-[Linux flash filesystems](#linux-flash-filesystems).
+[Linux flash filesystems](#linux-flash-filesystems). A U-Boot environment or a Belkin
+libnvram store found on the chip is handed over as a one-file volume holding its bytes (see
+[Raw flash dumps and NAND spare bytes](#raw-flash-dumps-and-nand-spare-bytes)).
 
 One file, Python 3 standard library only. Nothing to install, no admin rights, and
 it never writes to the image. A second, optional file, `qnxprobe_gui.py`, puts a
@@ -1152,6 +1154,36 @@ UBI runs over the following eraseblocks that carry the same image sequence numbe
 erased; JFFS2 records no size, so it runs to the next volume found or the end of the
 image. YAFFS has no header to search for, so it is read only when it fills the image or a
 partition.
+
+Since 1.54 the same pass also finds two configuration stores a flash chip keeps beside its
+filesystems: the U-Boot environment, and the libnvram store Belkin WeMo devices keep, which
+opens with `NVRM`. Neither is a filesystem, so each is reported as a volume holding one
+file, `uboot-env.bin` or `nvram.bin`: the store's bytes as held on flash, for a consumer to
+parse. The report gives a store's layout and how many name=value strings it holds, never
+their values. A store is named by its layout, and the layout does not say which program wrote
+it. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
+steps up to 256 KiB, and a U-Boot environment only when its first string opens with a name
+and `=` and its strings end inside it. A store sits in its own MTD partition, so a JFFS2 in
+front of one ends where it begins. A partition or a file is taken for a store when the store
+fills it or only erased flash follows, so a dump that merely begins with an environment is
+still searched for the rest.
+
+The U-Boot layout is `env_t` in
+[include/env_internal.h](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86)
+(v2024.01): a little-endian CRC-32, a flags byte only on a board that keeps a redundant copy,
+then NUL-separated strings ending in an empty one, the CRC covering the rest of the
+environment as
+[`env_import`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310)
+checks it. The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
+header carries Belkin's copyright), as found in a public copy of the WeMo firmware tree,
+[libnvram.c](https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
+`NVRM`, a CRC-32 over the partition less the 16-byte header, an entry count and the offset
+of the end of the data, then the strings. The count and end of data are reported as stored
+and not checked, because the CRC does not cover them and libnvram rebuilds both from the
+strings. Both layouts are round-trip tested on stores the self-test builds, one U-Boot
+environment of each layout and an NVRM store after the JFFS2 fixture, with three controls
+that must not be claimed: one flipped data byte, strings that never end, and a CRC over a
+shorter length.
 
 A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
 data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise that
