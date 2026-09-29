@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.53"
+QNXPROBE_VERSION = "1.54"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -10041,6 +10041,13 @@ def walker_for(kind, fh, base, size=None):
         return _cached_walker(fh, base, size, kind, lambda: Jffs2Walker(fh, base, size))
     if kind in ("yaffs1", "yaffs2"):
         return _cached_walker(fh, base, size, kind, lambda: YaffsWalker(fh, base, size))
+    room = CFG_STORE_MAX if size is None else size
+    if kind == "nvram":
+        st = nvram_store(fh, base, room)
+        return ConfigStoreWalker(fh, base, st[0], "nvram.bin") if st else None
+    if kind == "uboot-env":
+        st = uboot_env_store(fh, base, room)
+        return ConfigStoreWalker(fh, base, st[0], "uboot-env.bin") if st else None
     return None
 
 
@@ -11215,6 +11222,13 @@ def identify_fs(fh, base, size=None):
     if bde:
         return bde
 
+    # The configuration stores a flash chip carries beside its filesystems. Each
+    # is accepted only on a CRC-32 that holds over the store.
+    for ident in (identify_nvram, identify_uboot_env):
+        found = ident(fh, base, size)
+        if found:
+            return found
+
     sb = read_at(fh, base + EXT_SB_OFF, 1024)
     if len(sb) == 1024 and _e(sb, "magic", 2) == EXT_MAGIC:
         bs = 1024 << _e(sb, "log_block_size")
@@ -11370,6 +11384,174 @@ def volume_name(part_idx, lba, label=""):
 EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 
 
+# ---------------------------------------------------------------------------
+# Configuration stores on flash
+#
+# A flash chip also carries name=value stores that are not filesystems: the
+# U-Boot environment, and on Belkin WeMo devices Belkin's libnvram store.
+# Neither has a directory, so each is given as a volume holding one file, the
+# store's bytes as they sit on the chip, for a consumer to parse. Both are
+# accepted only on a CRC-32 that holds over the store, and a store's size is the
+# one its CRC holds for, tried in 4 KiB steps up to CFG_STORE_MAX.
+#
+# U-Boot environment, env_t in include/env_internal.h at v2024.01
+# (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86):
+# a little-endian CRC-32, a flags byte only when the board keeps a redundant copy
+# (ENV_HEADER_SIZE, lines 59-61), then CONFIG_ENV_SIZE less that header of
+# NUL-separated name=value strings ending in an empty one. env_import() checks
+# crc32(0, data, ENV_SIZE) before it reads them
+# (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310).
+#
+# Belkin libnvram store, env_image_gemtek in a mirror of Belkin's WeMo GPL
+# release (https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
+# "NVRM", a CRC-32, an entry count and the offset of the end of the data, then
+# NUL-separated name=value strings. The CRC covers the partition less the
+# 16-byte header (lines 853-874); the count and end of data are written after it,
+# from the index of strings (lines 420-450 and 1165-1178).
+# ---------------------------------------------------------------------------
+CFG_STORE_MAX = 256 << 10         # the largest store size tried
+CFG_KINDS = ("nvram", "uboot-env")
+NVRM_MAGIC = b"NVRM"
+NVRM_HEADER = 16
+_CFG_NAME = re.compile(rb"[A-Za-z0-9_.:+-]{1,64}=")   # what a store's first string opens with
+
+
+def _cfg_crc_size(fh, base, start, crc, room):
+    """The smallest size, a multiple of 4 KiB and at most room and CFG_STORE_MAX,
+    for which the CRC-32 of the bytes from base + start to base + size is crc,
+    or None. One read and one pass, whatever the number of sizes tried."""
+    buf = read_at(fh, base, max(0, min(room, CFG_STORE_MAX)))
+    c, done = 0, start
+    for size in range(FLASH_ALIGN, len(buf) + 1, FLASH_ALIGN):
+        if size <= start:
+            continue
+        c = binascii.crc32(buf[done:size], c)
+        done = size
+        if c == crc:
+            return size
+    return None
+
+
+def cfg_strings(data):
+    """(strings, ended): the NUL-separated strings of a store's data, up to the
+    first empty one, and whether that empty one was found inside data."""
+    items, pos = [], 0
+    while pos < len(data):
+        end = data.find(b"\x00", pos)
+        if end < 0:
+            return items, False
+        if end == pos:
+            return items, True
+        items.append(data[pos:end])
+        pos = end + 1
+    return items, False
+
+
+def nvram_store(fh, base, room):
+    """(size, count, eod) for a libnvram store at base whose CRC-32 holds, else
+    None. count and eod are as the header stores them; the CRC does not cover
+    them, and libnvram rebuilds both from the strings, so they are reported and
+    not checked."""
+    head = read_at(fh, base, NVRM_HEADER)
+    if len(head) < NVRM_HEADER or head[:4] != NVRM_MAGIC:
+        return None
+    crc, count, eod = struct.unpack_from("<III", head, 4)
+    size = _cfg_crc_size(fh, base, NVRM_HEADER, crc, room)
+    if size is None:
+        return None
+    return size, count, eod
+
+
+def uboot_env_store(fh, base, room):
+    """(size, header, flags) for a U-Boot environment at base whose CRC-32 holds
+    and whose strings end inside it, else None. header is 4 for a single copy and
+    5 for one of a redundant pair, whose flags byte is returned (else None)."""
+    head = read_at(fh, base, 5 + 65)
+    if len(head) < 8:
+        return None
+    crc = struct.unpack_from("<I", head)[0]
+    for hdr in (4, 5):
+        if not _CFG_NAME.match(head, hdr):
+            continue
+        size = _cfg_crc_size(fh, base, hdr, crc, room)
+        if size is None:
+            continue
+        strings, ended = cfg_strings(read_at(fh, base + hdr, size - hdr))
+        if ended and strings:
+            return size, hdr, (head[4] if hdr == 5 else None)
+    return None
+
+
+def _erased_after(fh, start, end):
+    """True when every byte from start to end (or the end of the image) is 0xFF."""
+    pos = start
+    while pos < end:
+        chunk = read_at(fh, pos, min(1 << 20, end - pos))
+        if not chunk:
+            return True
+        if chunk.strip(b"\xff"):
+            return False
+        pos += len(chunk)
+    return True
+
+
+def identify_nvram(fh, base, size):
+    """Return ("nvram", lines) for a libnvram store at base that fills the region
+    or is followed only by erased flash, else None."""
+    st = nvram_store(fh, base, size)
+    if not st or not _erased_after(fh, base + st[0], base + size):
+        return None
+    n, count, eod = st
+    strings, _ = cfg_strings(read_at(fh, base + NVRM_HEADER, n - NVRM_HEADER))
+    return "nvram", [
+        "format       Belkin libnvram store (NVRM header), CRC-32 holds",
+        f"store        {human(n)}, {len(strings)} name=value strings "
+        f"(header count {count}, end of data at {eod})",
+        "file         nvram.bin, the store's bytes as held on flash"]
+
+
+def identify_uboot_env(fh, base, size):
+    """Return ("uboot-env", lines) for a U-Boot environment at base that fills
+    the region or is followed only by erased flash, else None. The second
+    condition keeps a dump that merely begins with an environment from being
+    taken for one, so its other regions are still searched (flash_regions)."""
+    st = uboot_env_store(fh, base, size)
+    if not st or not _erased_after(fh, base + st[0], base + size):
+        return None
+    n, hdr, flags = st
+    strings, _ = cfg_strings(read_at(fh, base + hdr, n - hdr))
+    layout = ("a 4-byte header, the single-copy layout" if hdr == 4 else
+              f"a 5-byte header, the redundant-copy layout (flags byte {flags})")
+    return "uboot-env", [
+        "format       U-Boot environment, CRC-32 holds",
+        f"store        {human(n)}, {layout}, {len(strings)} name=value strings",
+        "file         uboot-env.bin, the store's bytes as held on flash"]
+
+
+class ConfigStoreWalker:
+    """A configuration store as a volume holding one file: the store's bytes, as
+    held on flash, under name. It records no time, so none is reported."""
+    root = 1
+    _FILE = 2
+
+    def __init__(self, fh, base, size, name):
+        self.fh, self.base, self.size, self.name = fh, base, size, name
+
+    def listdir(self, node):
+        return [(self.name, self._FILE)] if node == self.root else []
+
+    def entry(self, node):
+        if node == self.root:
+            return (S_IFDIR | 0o555, 0, None)
+        if node == self._FILE:
+            return (S_IFREG | 0o444, self.size, None)
+        return None
+
+    def read_file(self, node, size):
+        if node == self._FILE:
+            yield read_at(self.fh, self.base, min(size, self.size))
+
+
 # A raw NOR or NAND dump has no partition table: the kernel learns the MTD
 # partitions from the device tree or its command line, which the dump does not
 # carry. The bootloader usually sits at offset 0, so nothing is recognised
@@ -11431,7 +11613,13 @@ def flash_regions(fh, size):
                 with no table the image carries (the kernel can take the layout
                 from its command line, blkdevparts= in block/partitions/
                 cmdline.c), and its writable data can sit in ext4 there
+      NVRM      a Belkin libnvram store whose CRC-32 holds (nvram_store); its
+                extent is the size that CRC holds for
+      U-Boot    an environment whose first string opens with a name and "="
+                and whose CRC-32 holds (uboot_env_store); its extent likewise
 
+    A configuration store is not a filesystem, but it has an extent of its own
+    and sits in its own MTD partition, so a JFFS2 in front of it ends there.
     A backup superblock names its own block group, so it is never taken for a
     filesystem, and a hit inside a filesystem already found (an ext image kept
     as a file, a backup copy) is skipped.
@@ -11446,7 +11634,7 @@ def flash_regions(fh, size):
         chunk = read_at(fh, pos, min(step + EXT_SB_OFF + 64, size - pos))
         if not chunk:
             break
-        for magic in (b"hsqs", b"UBI#", b"\x85\x19", b"\x19\x85"):
+        for magic in (b"hsqs", b"UBI#", b"\x85\x19", b"\x19\x85", NVRM_MAGIC):
             j = chunk.find(magic)
             while 0 <= j < step:
                 if (pos + j) % FLASH_ALIGN == 0:
@@ -11456,6 +11644,8 @@ def flash_regions(fh, size):
         for k in range(0, min(step, len(chunk) - m - 1), FLASH_ALIGN):
             if chunk[k + m:k + m + 2] == b"\x53\xef":
                 hits.add((pos + k, b"ext"))
+            if _CFG_NAME.match(chunk, k + 4) or _CFG_NAME.match(chunk, k + 5):
+                hits.add((pos + k, b"env"))       # a U-Boot environment's first string
         pos += step
     found, taken_to = [], 0
     for off, magic in sorted(hits):
@@ -11491,6 +11681,16 @@ def flash_regions(fh, size):
             if not (kind or "").startswith("ext"):
                 continue
             found.append([kind, off, ext])
+        elif magic == NVRM_MAGIC:
+            st = nvram_store(fh, off, size - off)
+            if not st:
+                continue
+            found.append(["nvram", off, st[0]])
+        elif magic == b"env":
+            st = uboot_env_store(fh, off, size - off)
+            if not st:
+                continue
+            found.append(["uboot-env", off, st[0]])
         else:
             e = "<" if magic == b"\x85\x19" else ">"
             hdr = read_at(fh, off, 12)
@@ -12209,7 +12409,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
 
                 if kind in ("fat32", "exfat", "ntfs", "f2fs", "hfs+", "hfsx", "apfs",
                             "etfs", "efs", "qnx4", "squashfs", "jffs2", "ubi",
-                            "ubifs", "yaffs1", "yaffs2") and wanted:
+                            "ubifs", "yaffs1", "yaffs2") + CFG_KINDS and wanted:
                     if do_list:
                         print(f"        CONTENTS  (depth {list_depth})")
                         try:
@@ -17100,6 +17300,106 @@ def self_test():
                   f"not searched for more ("
                   + ", ".join(f"{v['label']} {v['kind']}" for v in wv) + ")")
 
+        # A flash chip carries configuration stores beside its filesystems: the
+        # U-Boot environment and, on Belkin WeMo devices, a libnvram store. Built
+        # here from made-up strings: random bytes, a single-copy environment
+        # (8 KiB) at 0x10000, a redundant-layout one (4 KiB, flags byte 3) at
+        # 0x14000, the JFFS2 fixture at 0x20000, a 64 KiB NVRM store straight
+        # after it, then erased flash. volumes() must find the four, end the
+        # JFFS2 where the store begins, read the JFFS2 whole, and hand back each
+        # store's bytes exactly. The controls: one flipped data byte in a store,
+        # a store whose strings never end, and a CRC over the wrong length each
+        # leave the store unclaimed; an environment that is the whole file is
+        # recognised as the whole image, and one that only begins a larger file
+        # is not, so that file's other regions are still searched.
+        if os.path.isfile(jff):
+            import binascii as _ba, io as _io, random as _rnd, gzip as _gz
+            jf_raw = _gz.open(jff, "rb").read()
+            padto = lambda b, a: b + b"\xff" * (-len(b) % a)
+
+            def _env(strings, size, hdr=4, flags=1, ended=True):
+                data = b"\x00".join(strings) + (b"\x00\x00" if ended else b"\x00")
+                data = data.ljust(size - hdr, b"\x00" if ended else b"x")
+                return (struct.pack("<I", _ba.crc32(data))
+                        + (bytes([flags]) if hdr == 5 else b"") + data)
+
+            def _nvrm(strings, size):
+                body = b"".join(s + b"\x00" for s in strings)
+                data = (body + b"\x00").ljust(size - NVRM_HEADER, b"\xff")
+                return (NVRM_MAGIC + struct.pack("<III", _ba.crc32(data), len(strings),
+                                                 NVRM_HEADER + len(body)) + data)
+
+            e1 = _env([b"bootdelay=1", b"baudrate=57600", b"ethaddr=00:11:22:33:44:55"], 0x2000)
+            e2 = _env([b"example_addr=192.0.2.1", b"example_mode=test"], 0x1000, hdr=5, flags=3)
+            nv = _nvrm([b"example_name=Test Plug", b"example_id=000TEST000",
+                        b"example_zone=-5.0"], 0x10000)
+            jpad = padto(jf_raw, 65536)
+            nor = bytearray(_rnd.Random(11).randbytes(0x20000))
+            nor[0x10000:0x10000 + len(e1)] = e1
+            nor[0x14000:0x14000 + len(e2)] = e2
+            nor += jpad + nv
+            nor += b"\xff" * ((2 << 20) - len(nor))
+            nv_at = 0x20000 + len(jpad)
+            want = [(0x10000, "uboot-env", len(e1)), (0x14000, "uboot-env", len(e2)),
+                    (0x20000, "jffs2", len(jpad)), (nv_at, "nvram", len(nv))]
+            vols = volumes(_io.BytesIO(bytes(nor)), len(nor))
+            got = [(v["base"], v["kind"], v["size"]) for v in vols]
+            reads = {}
+            for v in vols:
+                w = v.get("walker")
+                if v["kind"] in CFG_KINDS and w:
+                    [(fname, node)] = w.listdir(w.root)
+                    reads[v["base"]] = (fname, b"".join(w.read_file(node, w.entry(node)[1])))
+            jentries = sum(1 for v in vols if v["kind"] == "jffs2" and v.get("walker")
+                           for _e in collect(v["walker"], v["walker"].root))
+            ccond = (got == want and jentries == 310 + 3
+                     and reads == {0x10000: ("uboot-env.bin", e1), 0x14000: ("uboot-env.bin", e2),
+                                   nv_at: ("nvram.bin", nv)}
+                     and uboot_env_store(_io.BytesIO(e2), 0, len(e2)) == (len(e2), 5, 3))
+            if not ccond:
+                ok = False
+            print(f"  [{'PASS' if ccond else 'FAIL'}] a flash dump's U-Boot environments and "
+                  f"libnvram store are found by their CRC-32, one of each layout, and each "
+                  f"read back byte for byte; the JFFS2 before the store ends where it begins "
+                  f"({', '.join(f'{k} {b:#x} {human(n)}' for b, k, n in got)}; "
+                  f"{jentries} JFFS2 entries)")
+
+            flipped = bytearray(nor)
+            flipped[0x10000 + 40] ^= 1                  # a data byte of the first environment
+            flipped[nv_at + NVRM_HEADER + 3] ^= 1        # a data byte of the store
+            unended = bytearray(nor)
+            unended[0x14000:0x14000 + len(e2)] = _env([b"example_addr=192.0.2.1"], 0x1000,
+                                                       hdr=5, ended=False)
+            short = bytearray(nor)                       # a CRC over less than the store
+            sd = bytes(e1[4:0x1000])
+            short[0x10000:0x10004] = struct.pack("<I", _ba.crc32(sd[:0x800]))
+            kinds = lambda img: [(v["base"], v["kind"]) for v in volumes(_io.BytesIO(bytes(img)),
+                                                                        len(img))]
+            nk = [kinds(flipped), kinds(unended), kinds(short)]
+            ncond = (not any(b == 0x10000 for b, _k in nk[0])
+                     and not any(k == "nvram" for _b, k in nk[0])
+                     and not any(b == 0x14000 for b, _k in nk[1])
+                     and not any(b == 0x10000 for b, _k in nk[2]))
+            if not ncond:
+                ok = False
+            print(f"  [{'PASS' if ncond else 'FAIL'}] and a store with one flipped data byte, "
+                  f"one whose strings never end, or one whose CRC covers a shorter length is "
+                  f"not claimed")
+
+            alone = kinds(e1)
+            leading = bytearray(e1) + _rnd.Random(12).randbytes(0x8000)
+            leading[0x6000:0x6000 + len(e2)] = e2
+            lead_kinds = kinds(leading)
+            wcond = (alone == [(0, "uboot-env")]
+                     and lead_kinds == [(0, "uboot-env"), (0x6000, "uboot-env")]
+                     and [v["label"] for v in volumes(_io.BytesIO(bytes(leading)), len(leading))]
+                     == ["flash @0x0 uboot-env", "flash @0x6000 uboot-env"])
+            if not wcond:
+                ok = False
+            print(f"  [{'PASS' if wcond else 'FAIL'}] and an environment that is the whole file "
+                  f"is that file ({alone}), while one that only begins a larger file leaves "
+                  f"the rest to be searched ({lead_kinds})")
+
         # An eMMC image from an embedded device can hold ext filesystems with no
         # partition table in front of them. Built here: 1.25 MiB of random bytes,
         # then the ext4 fixture and the ext2 fixture at 4 KiB boundaries, then a
@@ -18049,7 +18349,8 @@ if __name__ == "__main__":
         prog="qnxprobe.py",
         description="Read QNX6, QNX4, ETFS, EFS, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+ and "
                     "APFS filesystems, the Linux flash filesystems SquashFS, JFFS2, "
-                    "UBI/UBIFS and YAFFS1/YAFFS2, and QNX IFS boot images, out of "
+                    "UBI/UBIFS and YAFFS1/YAFFS2, QNX IFS boot images, and the U-Boot "
+                    "environment and Belkin libnvram stores a flash chip carries, out of "
                     "raw disk images and flash dumps: identify each by its own "
                     "on-disk structure rather "
                     "than trusting a partition type byte, list, and extract to a "
