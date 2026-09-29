@@ -17307,7 +17307,7 @@ def self_test():
         # U-Boot environment and, on Belkin WeMo devices, a libnvram store. Built
         # here from made-up strings: random bytes, a single-copy environment
         # (8 KiB) at 0x10000, a redundant-layout one (4 KiB, flags byte 3) at
-        # 0x14000, the JFFS2 fixture at 0x20000, a 64 KiB NVRM store straight
+        # 0x14000, the JFFS2 fixture at 0x20000, a 32 KiB NVRM store straight
         # after it, then erased flash. volumes() must find the four, end the
         # JFFS2 where the store begins, read the JFFS2 whole, and hand back each
         # store's bytes exactly. The controls: one flipped data byte in a store,
@@ -17335,7 +17335,7 @@ def self_test():
             e1 = _env([b"bootdelay=1", b"baudrate=57600", b"ethaddr=00:11:22:33:44:55"], 0x2000)
             e2 = _env([b"example_addr=192.0.2.1", b"example_mode=test"], 0x1000, hdr=5, flags=3)
             nv = _nvrm([b"example_name=Test Plug", b"example_id=000TEST000",
-                        b"example_zone=-5.0"], 0x10000)
+                        b"example_zone=1.0"], 0x8000)
             jpad = padto(jf_raw, 65536)
             nor = bytearray(_rnd.Random(11).randbytes(0x20000))
             nor[0x10000:0x10000 + len(e1)] = e1
