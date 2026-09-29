@@ -1094,7 +1094,12 @@ from the device tree or its command line, which the dump does not carry), and us
 bootloader at offset 0. So when an image has no partition table and nothing is recognised
 at its start, qnxprobe looks for SquashFS, UBI and JFFS2 at every 4 KiB boundary of an
 image up to 8 GiB, checks each candidate the way identification does, and reports each one
-it finds as its own volume, under `FLASH` in the report:
+it finds as its own volume, under `FLASH` in the report. Since 1.51 the same pass also looks
+for ext2, ext3 and ext4, because an eMMC image from an embedded device can hold its
+partitions with no table the image carries (the kernel can take the layout from its
+command line instead, `blkdevparts=` in
+[block/partitions/cmdline.c](https://github.com/torvalds/linux/blob/72d3fcf802c45d00b300f25b848a93c3a2bd7c7e/block/partitions/cmdline.c#L287)),
+and its writable data can sit in ext4 there:
 
 ```
   FLASH    no partition table and nothing recognised at offset 0; 2 flash filesystem(s) found by their own headers
@@ -1102,10 +1107,14 @@ it finds as its own volume, under `FLASH` in the report:
     @0x150000 jffs2           2.7 MiB  at byte 1,376,256
 ```
 
-A SquashFS volume ends where its superblock says; UBI runs over the following eraseblocks
-that carry the same image sequence number, or are erased; JFFS2 records no size, so it
-runs to the next volume found or the end of the image. YAFFS has no header to search for,
-so it is read only when it fills the image or a partition.
+An ext filesystem is taken only from a primary superblock (block group 0; a backup copy
+names its own group) whose root directory reads, and it ends at the block count it
+records. A superblock inside a filesystem already found, such as an ext image kept as a
+file, is not reported as another volume. A SquashFS volume ends where its superblock says;
+UBI runs over the following eraseblocks that carry the same image sequence number, or are
+erased; JFFS2 records no size, so it runs to the next volume found or the end of the
+image. YAFFS has no header to search for, so it is read only when it fills the image or a
+partition.
 
 A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
 data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise that
