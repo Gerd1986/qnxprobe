@@ -1185,6 +1185,25 @@ environment of each layout and an NVRM store after the JFFS2 fixture, with three
 that must not be claimed: one flipped data byte, strings that never end, and a CRC over a
 shorter length.
 
+Two JFFS2 partitions can sit side by side with nothing between them, an OpenWrt overlay
+followed by a vendor's settings partition for example. Each numbers its inodes and versions
+from 1, so read as one filesystem a name from one partition would show the other's file of
+the same number. Within one filesystem an inode number and version name one node (garbage
+collection copies a node unchanged, and the one rewrite that keeps a version, a partly
+overwritten hole, keeps its range), and a directory's version names one entry. So when a
+JFFS2 region holds two nodes with the same inode number and version but a different file
+type, range or data, or two entries with the same directory and version but a different
+name or target, obsolete nodes included, qnxprobe cuts the region along erase blocks
+(found from the spacing of the clean markers, else 4 KiB) into contiguous pieces with no
+such conflict inside any of them. Where more than one cut would do, it takes the one that
+separates the fewest names from their own inodes and directories, counting a name only
+where its recorded time matches a time on that inode or directory: the kernel gives a new
+file's name the new inode's time, a new symlink's, directory's or device's name a time read
+a moment after its inode's, and the directory the name's time. Each piece is then listed and read as its own filesystem. A
+region with no conflict is read whole, as before. Where a cut falls inside the erased
+blocks between two partitions cannot be known from the nodes, so the boundary is placed at
+the second partition's first block that holds one.
+
 A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
 data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise that
 does not look like noise: the spare holds error-correction bytes and, on NAND, JFFS2's own

@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.54"
+QNXPROBE_VERSION = "1.55"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -7349,6 +7349,10 @@ class Jffs2Walker:
         # supersedes or frees by clearing one bit; its bytes are untouched).
         self.all_dirents = []                         # (version, pino, name, ino, mctime)
         self.obsolete = []                            # (offset, node type, endian)
+        # For jffs2_filesystems(): where each clean marker and each valid
+        # dirent sits, region-relative (in the spare-stripped view on NAND).
+        self.cleanmarkers = []                        # offset
+        self.dirent_nodes = []                        # (offset, pino, version, ino, dtype, name, mctime)
 
     def _scan(self):
         """Walk the region a 4 MiB chunk at a time, checking every 4-byte
@@ -7404,6 +7408,8 @@ class Jffs2Walker:
         elif ntype == JFFS2_INODE:
             self._inode(off, totlen, e)
         else:
+            if ntype == JFFS2_CLEANMARKER:
+                self.cleanmarkers.append(off)
             self.stats[{JFFS2_CLEANMARKER: "cleanmarker", JFFS2_PADDING: "padding",
                         JFFS2_SUMMARY: "summary", JFFS2_XATTR: "xattr",
                         JFFS2_XREF: "xref"}.get(ntype, "other")] += 1
@@ -7435,6 +7441,7 @@ class Jffs2Walker:
         pino, version, ino, mctime, dtype, name = d
         self.stats["dirent"] += 1
         self.all_dirents.append((version, pino, name, ino, mctime))
+        self.dirent_nodes.append((off, pino, version, ino, dtype, name, mctime))
         cur = self.dirents[pino].get(name)
         if cur is None or version > cur[0]:
             self.dirents[pino][name] = (version, ino, dtype, mctime)
@@ -7536,6 +7543,96 @@ class Jffs2Walker:
         for i in range(0, len(view), 1 << 20):
             yield bytes(view[i:i + (1 << 20)])
 
+    # -- more than one filesystem in the region --------------------------------
+    def node_conflicts(self, unit=1):
+        """(conflicts, links, same_unit, units) for telling apart JFFS2
+        filesystems that sit side by side in one region, with node offsets
+        grouped into units of `unit` bytes.
+
+        Within one filesystem an inode number and version name one node, and a
+        directory's version and the name it records one dirent: the kernel takes
+        each new version as ++highest_version of the inode (fs/jffs2/write.c,
+        fs/jffs2/dir.c, fs/jffs2/gc.c at the commit cited above), garbage
+        collection copies a pristine node as it is (gc.c:696), and the one
+        rewrite that keeps a version, a partly obsoleted hole, keeps its range
+        and takes only the mode bits, size and times anew (gc.c:1030-1098). So
+        two nodes with the same inode number and version but a different file
+        type, range or data CRC, or two dirents with the same parent and version
+        but a different name or target, cannot share a filesystem. `conflicts` is the
+        set of unit pairs holding such nodes, and `same_unit` counts the pairs
+        that fall in one unit, which no split along units can separate. Nodes
+        the kernel marked obsolete count too: their bytes are untouched and they
+        belong to the filesystem that wrote them. `units` is every unit holding
+        a node.
+
+        `links` counts, per unit pair, a dirent and a node of the inode it
+        names, of the file type the dirent records, or of the directory it sits
+        in, whose ctime or mtime is the dirent's mctime. The kernel writes a new
+        file's name with the new inode's ctime (write.c:518 jffs2_do_create); for
+        a symlink, directory or device it reads the clock again for the name a
+        moment after the inode (dir.c:412, 557, 733; fs.c:479), so the two
+        usually agree to the second; and it gives the directory the name's time
+        (dir.c:430-431), which the directory's next inode node carries. A name
+        meeting a number the other filesystem also uses almost never matches.
+        Only inode numbers that carry no conflicting node and no second file
+        type count."""
+        sigs = collections.defaultdict(lambda: collections.defaultdict(set))
+        for ino, nodes in self.inodes.items():
+            for n in nodes:
+                sigs[("i", ino, n["version"])][(n["mode"] & S_IFMT, n["doff"], n["dsize"],
+                                                  n["data_crc"])].add(n["off"] // unit)
+        for off, pino, version, ino, _dt, name, _mct in self.dirent_nodes:
+            sigs[("d", pino, version)][(name, ino)].add(off // unit)
+        for off, ntype, e in self.obsolete:
+            totlen = struct.unpack(e + "HHII", read_at(self.fh, self.base + off, 12))[2]
+            if ntype == JFFS2_INODE:
+                got = self._parse_inode(off, totlen, e, obsolete=True)
+                if got:
+                    ino, n = got
+                    sigs[("i", ino, n["version"])][(n["mode"] & S_IFMT, n["doff"], n["dsize"],
+                                                    n["data_crc"])].add(off // unit)
+            else:
+                d = self._parse_dirent(off, totlen, e, obsolete=True)
+                if d:
+                    pino, version, ino, _mct, _dt, name = d
+                    sigs[("d", pino, version)][(name, ino)].add(off // unit)
+        units = {u for by_sig in sigs.values() for held in by_sig.values() for u in held}
+        conflicts, same_unit, reused = set(), 0, set()
+        for key, by_sig in sigs.items():
+            if len(by_sig) < 2:
+                continue
+            if key[0] == "i":
+                reused.add(key[1])
+            groups = list(by_sig.values())
+            for i, first in enumerate(groups):
+                for second in groups[i + 1:]:
+                    for u in first:
+                        for v in second:
+                            if u == v:
+                                same_unit += 1
+                            else:
+                                conflicts.add((min(u, v), max(u, v)))
+        for ino, nodes in self.inodes.items():
+            if len({n["mode"] & S_IFMT for n in nodes}) > 1:
+                reused.add(ino)
+        dtype_mode = {4: S_IFDIR, 8: S_IFREG, 10: S_IFLNK}
+        links = collections.Counter()
+        for off, pino, _version, ino, dtype, _name, mctime in self.dirent_nodes:
+            u = off // unit
+            ends = []
+            if ino and ino not in reused:
+                ends += [n for n in self.inodes.get(ino, ())
+                         if n["mode"] & S_IFMT == dtype_mode.get(dtype)
+                         and mctime in (n["ctime"], n["mtime"])]
+            if pino not in reused:
+                ends += [n for n in self.inodes.get(pino, ())
+                         if n["mode"] & S_IFMT == S_IFDIR and mctime in (n["ctime"], n["mtime"])]
+            for n in ends:
+                v = n["off"] // unit
+                if v != u:
+                    links[(min(u, v), max(u, v))] += 1
+        return conflicts, links, same_unit, units
+
 
     # -- deleted files ---------------------------------------------------------
     def recover_deleted(self):
@@ -7619,6 +7716,89 @@ class Jffs2Walker:
             yield bytes(view[i:i + (1 << 20)])
 
 JFFS2_LEAD_MAX = 64 << 20      # how much erased flash may come before the first node
+
+
+JFFS2_SPLIT_MAX_UNITS = 2048
+
+
+def jffs2_filesystems(fh, base, size):
+    """[(base, size)] of the JFFS2 filesystems in a region, in order.
+
+    A flash dump with no partition table can hold two JFFS2 partitions side by
+    side (an OpenWrt overlay and a vendor's settings, for example), and read as
+    one region they mix: each filesystem numbers its inodes and versions from
+    1, so a name from one would show the content of the other's file of the
+    same number. Nodes that cannot share a filesystem (Jffs2Walker.
+    node_conflicts) say the region holds more than one. It is then cut, along
+    erase blocks, into contiguous pieces with no conflict inside any of them,
+    choosing the cut that separates the fewest dirents from the inodes and
+    directories they name. A partition is a contiguous run of erase blocks. A
+    region with no conflicts, or one that cannot be cut cleanly, is returned
+    whole.
+
+    The erase block is the spacing of the clean markers the kernel writes at
+    the start of each erased block (their greatest common divisor); with none
+    (on NAND they live in the spare bytes) 4 KiB, no larger than any erase
+    block, is the unit."""
+    import math
+    whole = [(base, size)]
+    try:
+        w = Jffs2Walker(fh, base, size)
+    except (Jffs2Unreadable, OSError, struct.error):
+        return whole
+    unit = 0
+    for off in w.cleanmarkers:
+        unit = math.gcd(unit, off)
+    # A whole page at least, so a boundary in the spare-stripped view maps to
+    # the start of a page in the image (image_offset below).
+    page = w.nand[0] if w.nand else 1
+    unit = max(unit if unit >= 4096 else 4096, page)
+    conflicts, links, same_unit, held = w.node_conflicts(unit)
+    if not conflicts or same_unit:
+        return whole
+    units = sorted(held)
+    m = len(units)
+    if m > JFFS2_SPLIT_MAX_UNITS:
+        return whole
+    at = {u: i for i, u in enumerate(units)}
+    last_conflict = [-1] * m                    # latest earlier unit it conflicts with
+    for u, v in conflicts:
+        last_conflict[at[v]] = max(last_conflict[at[v]], at[u])
+    earlier = collections.defaultdict(list)     # unit index -> [(earlier index, links)]
+    for (u, v), count in links.items():
+        earlier[at[v]].append((at[u], count))
+    # best[i] = (links cut, pieces, start of the last piece) for units[:i]
+    best = [None] * (m + 1)
+    best[0] = (0, 0, 0)
+    for a in range(m):
+        if best[a] is None:
+            continue
+        cut, reach = best[a][0], -1
+        for b in range(a, m):
+            reach = max(reach, last_conflict[b])
+            if reach >= a:
+                break
+            cut += sum(c for i, c in earlier[b] if i < a)
+            cand = (cut, best[a][1] + 1, a)
+            if best[b + 1] is None or cand[:2] < best[b + 1][:2]:
+                best[b + 1] = cand
+    if best[m] is None or best[m][1] < 2:
+        return whole
+    starts, i = [], m
+    while i > 0:
+        starts.append(best[i][2])
+        i = best[i][2]
+    starts.reverse()
+
+    def image_offset(view_off):
+        if w.nand:
+            pg, spare = w.nand
+            return (view_off // pg) * (pg + spare)
+        return view_off
+    # Each piece opens at the first unit holding its own nodes, so a piece holds
+    # exactly the units the split gave it and no conflicting pair.
+    bounds = [0] + [image_offset(units[s] * unit) for s in starts[1:]] + [size]
+    return [(base + lo, hi - lo) for lo, hi in zip(bounds, bounds[1:])]
 
 
 def _jffs2_first_node(fh, base, size):
@@ -11609,7 +11789,9 @@ def flash_regions(fh, size):
                 the following eraseblocks that carry a header of the same
                 image_seq or are erased
       JFFS2     a node whose header CRC holds; JFFS2 has no size of its own, so
-                its extent runs to the next filesystem found, or the end
+                its extent runs to the next filesystem found, or the end, and a
+                region holding two JFFS2 partitions side by side is cut into
+                them (jffs2_filesystems)
       ext2/3/4  a primary superblock (block group 0) whose root directory reads
                 (_ext_primary_size); its extent is the block count it records.
                 An eMMC image from an embedded device can hold its partitions
@@ -11710,7 +11892,23 @@ def flash_regions(fh, size):
         if reg[2] is None:
             nxt = next((r[1] for r in found[i + 1:] if r[1] > reg[1]), size)
             reg[2] = nxt - reg[1]
-    return [(f"flash @{off:#x} {kind}", off, ext) for kind, off, ext in found]
+    out = []
+    for kind, off, ext in found:                 # side-by-side JFFS2 partitions
+        pieces = jffs2_filesystems(fh, off, ext) if kind == "jffs2" else [(off, ext)]
+        out += [(f"flash @{o:#x} {kind}", o, n) for o, n in pieces]
+    return out
+
+
+def raw_flash_layout(fh, size):
+    """The flash_regions() of an image with no partition table, or [] when a
+    filesystem opens the image at offset 0 and holds it whole. An image that
+    opens with JFFS2 is split with jffs2_filesystems() too, since a dump of two
+    JFFS2 partitions side by side opens with the first of them."""
+    kind = identify_fs(fh, 0, size)[0]
+    if kind == "jffs2":
+        pieces = jffs2_filesystems(fh, 0, size)
+        return [(f"flash @{o:#x} jffs2", o, n) for o, n in pieces] if len(pieces) > 1 else []
+    return [] if kind else flash_regions(fh, size)
 
 
 def partition_regions(fh, size):
@@ -11764,7 +11962,7 @@ def partition_regions(fh, size):
             regions.append((f"GPT part {idx} {name[:20]}", first * ss, sz))
             names[first * ss] = volume_name(idx, first, name)
     if not regions:
-        flash = [] if identify_fs(fh, 0, size)[0] else flash_regions(fh, size)
+        flash = raw_flash_layout(fh, size)
         for label, base, rsize in flash:
             regions.append((label, base, rsize))
             names[base] = volume_name(None, base // SECTOR)
@@ -12055,7 +12253,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
         if not sized_regions:
             # With nothing recognised at offset 0 either, it may be a raw flash
             # dump: look for the filesystems inside it (flash_regions).
-            flash = [] if identify_fs(fh, 0, size)[0] else flash_regions(fh, size)
+            flash = raw_flash_layout(fh, size)
             if flash:
                 print(f"\n  FLASH    no partition table and nothing recognised at offset 0; "
                       f"{len(flash)} flash filesystem(s) found by their own headers")
@@ -17109,6 +17307,157 @@ def self_test():
                   f"copy with a bad data CRC is still read, as the kernel attaches it: "
                   f"{sum(1 for v in ub_res.values() if v is None)} of {len(ub_res)} files match "
                   f"({un_lone} such LEB counted)")
+
+        # Two JFFS2 partitions side by side in a dump with no partition table:
+        # both number their inodes from 2, so read as one filesystem a name from
+        # one shows the other's file of the same number. mkfs.jffs2's image
+        # (padded to one 64 KiB erase block, as a partition is) then the
+        # kernel-written NOR image. Read as one region, some files must come out
+        # wrong (the fixture reaches the defect); split, each piece must match
+        # its own list, both for a dump opening with the first filesystem
+        # (raw_flash_layout) and for one behind a block of zeros (flash_regions).
+        # The erased blocks between the two hold no node, so the boundary may
+        # fall anywhere from the end of the first image to the second's first
+        # block that holds one.
+        js_a, js_b, js_n = (os.path.join(fx, f"{n}.img.gz")
+                            for n in ("jffs2-le-zlib", "jffs2-nor-history", "jffs2-nand-history"))
+        js_ha, js_hb, js_hn = (os.path.join(fx, n) for n in ("jffs2.src.sha256", "jffs2-nor.history.sha256",
+                                                             "jffs2-nand.history.sha256"))
+        if all(os.path.isfile(f) for f in (js_a, js_b, js_n, js_ha, js_hb, js_hn)):
+            with gzip.open(js_a, "rb") as gz:
+                js_first = gz.read()
+            with gzip.open(js_b, "rb") as gz:
+                js_second = gz.read()
+            js_first += b"\xff" * (-len(js_first) % 65536)
+            js_bw = Jffs2Walker(io.BytesIO(js_second), 0, len(js_second))
+            js_first_node = min([n["off"] for ns in js_bw.inodes.values() for n in ns]
+                                + [o for o, *_r in js_bw.dirent_nodes]
+                                + [o for o, *_r in js_bw.obsolete])
+            js_first_node -= js_first_node % 65536
+            js_merged = _sha_match(walker_for("jffs2", io.BytesIO(js_first + js_second), 0,
+                                              len(js_first) + len(js_second)), js_ha)
+            js_wrong = sum(1 for v in js_merged.values() if v)
+            # The NAND leg: mkfs.jffs2's image laid out as a raw NAND dump
+            # (2048-byte pages, 64 spare bytes, 64 pages an erase block), then the
+            # kernel-written NAND dump, whose offsets map back through the spare.
+            with gzip.open(js_n, "rb") as gz:
+                js_nand = gz.read()
+            js_pg, js_sp = 2048, 64
+            with gzip.open(js_a, "rb") as gz:
+                js_a2 = gz.read()
+            js_a2 += b"\xff" * (-len(js_a2) % (64 * js_pg))
+            js_first_nand = b"".join(js_a2[i:i + js_pg] + b"\xff" * js_sp
+                                     for i in range(0, len(js_a2), js_pg))
+            js_nw = Jffs2Walker(io.BytesIO(js_nand), 0, len(js_nand))
+            js_nfirst = min(n["off"] for ns in js_nw.inodes.values() for n in ns)
+            js_nfirst = (js_nfirst // js_pg) * (js_pg + js_sp)
+            js_results = []
+            for js_lead, js_one, js_two, js_limit, hashes in (
+                    (b"", js_first, js_second, js_first_node, (js_ha, js_hb)),
+                    (bytes(65536), js_first, js_second, js_first_node, (js_ha, js_hb)),
+                    (b"", js_first_nand, js_nand, js_nfirst, (js_ha, js_hn))):
+                js_img = js_lead + js_one + js_two
+                js_fh = io.BytesIO(js_img)
+                js_layout = raw_flash_layout(js_fh, len(js_img))
+                js_bases = [b for _l, b, _s in js_layout]
+                js_lo = len(js_lead) + len(js_one)
+                js_ok = (len(js_bases) == 2 and js_bases[0] == len(js_lead)
+                         and js_lo <= js_bases[1] <= js_lo + js_limit)
+                if js_ok:
+                    for (_l, b, s), hl in zip(js_layout, hashes):
+                        res = _sha_match(walker_for("jffs2", js_fh, b, s), hl)
+                        js_ok = js_ok and bool(res) and not any(res.values())
+                js_results.append((js_ok, js_bases))
+            cond = js_wrong > 0 and all(r[0] for r in js_results)
+            if not cond:
+                ok = False
+            print(f"  [{'PASS' if cond else 'FAIL'}] two JFFS2 partitions side by side are read "
+                  f"as two filesystems, each matching its own list (read as one, {js_wrong} "
+                  f"files come out wrong); split at "
+                  + " and ".join(str(r[1]) for r in js_results))
+
+        # Where conflicts alone allow more than one cut, the links decide. Three
+        # 4 KiB erase blocks written here from the node layouts cited above:
+        # block 0 holds root names a (inode 2) and c (inode 5) and inode 2's
+        # data, block 1 inode 5's data and nothing that conflicts with either
+        # side, block 2 another filesystem's root name b (inode 2, version 1)
+        # and its own inode 2. Only the link from c to inode 5 puts block 1 with
+        # block 0; cut after block 0 instead, c would lose its content.
+        def _jn(ntype, body):
+            head = struct.pack("<HHI", JFFS2_MAGIC, ntype, 12 + len(body))
+            node = head + struct.pack("<I", _kcrc32(head)) + body
+            return node + b"\xff" * (-len(node) % 4)
+
+        def _jdirent(pino, version, ino, name):
+            b = struct.pack("<IIIIBBH", pino, version, ino, 0, len(name), 8, 0)
+            head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_DIRENT, 40 + len(name))
+            head += struct.pack("<I", _kcrc32(head))
+            return _jn(JFFS2_DIRENT, b + struct.pack("<II", _kcrc32(head + b), _kcrc32(name))
+                       + name)
+
+        def _jinode(ino, version, data, mode=S_IFREG | 0o644, hole=0, isize=None):
+            dsize, compr = (hole, 1) if hole else (len(data), 0)     # 1: JFFS2_COMPR_ZERO
+            b = struct.pack("<IIIHHIIIIIIIBBH", ino, version, mode, 0, 0,
+                            dsize if isize is None else isize, 0, 0, 0, 0, len(data), dsize,
+                            compr, 0, 0)
+            head = struct.pack("<HHI", JFFS2_MAGIC, JFFS2_INODE, 68 + len(data))
+            head += struct.pack("<I", _kcrc32(head))
+            return _jn(JFFS2_INODE, b + struct.pack("<II", _kcrc32(data), _kcrc32(head + b))
+                       + data)
+
+        def _jblock(*nodes):
+            blk = _jn(JFFS2_CLEANMARKER, b"") + b"".join(nodes)
+            return blk + b"\xff" * (4096 - len(blk))
+        jl_img = (_jblock(_jdirent(1, 1, 2, b"a"), _jinode(2, 1, b"one"), _jdirent(1, 2, 5, b"c"))
+                  + _jblock(_jinode(5, 1, b"five"))
+                  + _jblock(_jdirent(1, 1, 2, b"b"), _jinode(2, 1, b"two")))
+        jl_fh = io.BytesIO(jl_img)
+        jl_layout = raw_flash_layout(jl_fh, len(jl_img))
+        jl_read = []
+        for _l, b, s in jl_layout:
+            jw = walker_for("jffs2", jl_fh, b, s)
+            jl_read.append({p: b"".join(jw.read_file(n, sz)) for p, n, _m, sz, _t, _r
+                            in walk_all(jw)})
+        cond = ([b for _l, b, _s in jl_layout] == [0, 8192]
+                and jl_read == [{"a": b"one", "c": b"five"}, {"b": b"two"}])
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] where conflicts allow more than one cut, the "
+              f"one that keeps names with their inodes is taken: pieces at "
+              f"{[b for _l, b, _s in jl_layout]}, holding {[sorted(r) for r in jl_read]}")
+
+        # A node the kernel marked obsolete still belongs to the filesystem that
+        # wrote it. Block 1 holds only an orphan inode (no name links it) and an
+        # obsolete node that conflicts with block 2's, so only that node puts
+        # block 1 with block 0.
+        def _obsolete(node):
+            return node[:2] + struct.pack("<H", JFFS2_INODE & ~JFFS2_ACCURATE) + node[4:]
+        jo_img = (_jblock(_jdirent(1, 1, 2, b"a"), _jinode(2, 1, b"one"))
+                  + _jblock(_obsolete(_jinode(2, 5, b"old")), _jinode(7, 1, b"orphan"))
+                  + _jblock(_jdirent(1, 1, 2, b"b"), _jinode(2, 5, b"two")))
+        jo_layout = raw_flash_layout(io.BytesIO(jo_img), len(jo_img))
+        cond = [b for _l, b, _s in jo_layout] == [0, 8192]
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] an obsolete node keeps its block with the "
+              f"filesystem that wrote it: pieces at {[b for _l, b, _s in jo_layout]}")
+
+        # And one filesystem is never cut: garbage collection rewrites a partly
+        # obsoleted hole with its own version and range but the mode bits of the
+        # moment (gc.c:1030-1098), so after a chmod two nodes share a version and
+        # differ in permission bits only.
+        jh_img = (_jblock(_jdirent(1, 1, 2, b"a"),
+                          _jinode(2, 1, b"", S_IFREG | 0o644, hole=8192),
+                          _jinode(2, 2, b"tail", S_IFREG | 0o644, isize=8192))
+                  + _jblock(_jinode(2, 1, b"", S_IFREG | 0o600, hole=8192, isize=8192),
+                            _jinode(2, 3, b"", S_IFREG | 0o600, isize=8192)))
+        jh_layout = raw_flash_layout(io.BytesIO(jh_img), len(jh_img))
+        cond = jh_layout == []
+        if not cond:
+            ok = False
+        print(f"  [{'PASS' if cond else 'FAIL'}] a filesystem whose rewritten hole differs "
+              f"from its first copy only in permission bits is left whole "
+              f"({len(jh_layout) or 1} piece(s))")
 
         # YAFFS writes wherever garbage collection freed a block, so a real
         # partition can open on blocks holding only data chunks, or only
