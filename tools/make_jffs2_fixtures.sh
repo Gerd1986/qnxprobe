@@ -13,6 +13,14 @@
 #   le-none   no compression at all
 #   le-sum    le-zlib run through sumtool, so every erase block ends in an
 #             erase block summary node a reader must step over
+#   le-lzma   LZMA (compression 0x08) for every node that shrinks, written by
+#             OpenWrt's patched mkfs.jffs2; built only when MKFS_JFFS2_LZMA names
+#             that binary (tools/make_jffs2_lzma_fixture.sh builds it and runs
+#             this script with ONLY=le-lzma)
+#
+# ONLY, a space-separated list of image names, builds just those images, so one
+# image can be added without rewriting the others (mkfs.jffs2 stamps /dev with
+# the time it ran). le-sum is made from le-zlib, so name both to rebuild it.
 #
 # Two oracles, both independent of the reader under test:
 #
@@ -92,9 +100,11 @@ for dirpath, dirs, files in os.walk(root):
         print(f"{st.st_mode:o} {st.st_size} {int(st.st_mtime)} {os.path.relpath(full, root)}")
 PY
 
+want() { [ -z "${ONLY:-}" ] || [[ " $ONLY " == *" $1 "* ]]; }
 build() {   # build <name> <mkfs.jffs2 options...>
     local name=$1; shift
-    mkfs.jffs2 -r "$src" -o "$work/$name.img" -e 64KiB -D "$work/devtable" "$@"
+    want "$name" || return 0
+    "${MKFS:-mkfs.jffs2}" -r "$src" -o "$work/$name.img" -e 64KiB -D "$work/devtable" "$@"
     gzip -9 -n -c "$work/$name.img" > "$out/jffs2-$name.img.gz"
     printf '%-8s %8d bytes, %7d gzipped\n' "$name" "$(stat -c%s "$work/$name.img")" \
         "$(stat -c%s "$out/jffs2-$name.img.gz")"
@@ -105,10 +115,15 @@ build be-zlib -b
 build le-lzo  -l -X lzo -x zlib -x rtime
 build le-rtime -l -x zlib
 build le-none -l -m none
+if [ -n "${MKFS_JFFS2_LZMA:-}" ]; then
+    MKFS=$MKFS_JFFS2_LZMA build le-lzma -l -X lzma -x rtime
+fi
+want le-sum && {
 sumtool -i "$work/le-zlib.img" -o "$work/le-sum.img" -e 64KiB -l
 gzip -9 -n -c "$work/le-sum.img" > "$out/jffs2-le-sum.img.gz"
 printf '%-8s %8d bytes, %7d gzipped\n' le-sum "$(stat -c%s "$work/le-sum.img")" \
     "$(stat -c%s "$out/jffs2-le-sum.img.gz")"
+}
 
 cp "$work/devtable" "$out/jffs2.devtable"
 cp "$work/jffs2.src.sha256" "$out/jffs2.src.sha256"

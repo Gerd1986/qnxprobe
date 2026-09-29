@@ -914,11 +914,16 @@ report counts the nodes dropped, and a name whose inode is left with no readable
 not listed, and counted too. For
 each name the newest version wins and a newer entry with inode 0 unlinks it; each file
 takes its mode, owner and times from its newest inode node and is cut to that node's size.
-The none, zero, rtime, zlib and LZO compressors are read; rubin, dynrubin and copy are
-reported and not read. Erase block summary nodes are stepped over.
+The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
+8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
+properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
+decoded to exactly the size the node records. Rubin, dynrubin and copy are reported and
+not read. Erase block summary nodes are stepped over.
 
-Validated on six images from `mkfs.jffs2` (both byte orders, zlib, LZO, rtime, none, and
-one run through `sumtool`): 310 of 310 files and 317 of 317 entries match, and the two
+Validated on seven images from `mkfs.jffs2` (both byte orders, zlib, LZO, rtime, none, one
+run through `sumtool`, and one written by OpenWrt's LZMA-patched `mkfs.jffs2`, which
+`tools/make_jffs2_lzma_fixture.sh` builds from pinned sources): 310 of 310 files and 317
+of 317 entries match, and the two
 device nodes carry the type and permissions the device table gave them. (`mkfs.jffs2`
 stamps device nodes, and so `/dev`, with the time it ran, so their times are not compared.)
 
@@ -937,7 +942,8 @@ UBI is the volume layer raw NAND runs under: each eraseblock carries an erase co
 header, and a mapped one a second header naming the volume and logical block it holds.
 The reader finds the eraseblock size from the distance between those headers, rebuilds
 each volume from its blocks (of two copies of one block the higher sequence number wins,
-unless it is a copy whose data CRC fails), and reads the volume table. A volume holding
+unless it is a copy whose data CRC fails; a block with one copy is used as it is, as the
+kernel attaches it), and reads the volume table. A volume holding
 UBIFS or SquashFS is listed as a folder named after the volume; any other volume, a kernel
 image for example, as a single file holding its bytes. UBI records no time for a volume,
 so none is shown for such a file.
@@ -950,6 +956,21 @@ dropping the blocks past the new size. LZO, zlib (raw deflate, as the kernel wri
 uncompressed data and, on Python 3.14 or later, zstd are read, and a block the index does
 not hold is a hole. A bare UBIFS image, as `mkfs.ubifs` writes it before `ubinize` wraps
 it, is read too.
+
+A raw NAND dump holds the bits as the cells gave them, before the controller's error
+correction fixed them, so a node the device read cleanly can fail its CRC in the dump by
+one flipped bit. When one bit accounts for the difference, qnxprobe restores it and reads
+the node, as the controller would have, and the report counts every node read that way:
+
+```
+        bit errors   4 node(s) failed their CRC by one flipped bit and were read with that bit restored, as the NAND controller's ECC would have done
+```
+
+CRC-32 gives every single bit of a message this size a different CRC change, so at most
+one bit fits, and its shortest weight-3 codeword is 91,640 bits, so on a node of up to
+11,450 bytes two flipped bits are never taken for one (the self-test finds that codeword).
+A node off by more than one bit is not read, and the file says why: its CRC fails by more
+than one bit, or its place reads as erased flash, so no copy of it is in the image.
 
 Validated on a bare `mkfs.ubifs` image and on five `ubinize` images (NAND with LZO, zlib,
 zstd and no compression, and NOR), each with three volumes: the UBIFS volume matches 410 of
@@ -1588,7 +1609,12 @@ byte for byte, and each source tree carries a file shaped to reach the decoders'
 instructions. LZO-RLE, the second LZO bitstream, which zram writes and none of these
 filesystems does, is refused rather than decoded. The kernel does not read SquashFS's
 legacy lzma format, so that one follows squashfs-tools' own `lzma_xz_wrapper.c` at commit
-`708c59ae80853b0845017c33b42e56061cc546cd`.
+`708c59ae80853b0845017c33b42e56061cc546cd`. Mainline Linux has no JFFS2 LZMA either, so
+compression 8 follows the OpenWrt patch that adds it,
+`target/linux/generic/pending-6.12/530-jffs2_make_lzma_available.patch` at OpenWrt commit
+`d9f8ecc394dd30537d7136963fa4f6891b59c1ee` (the id at line 1094, the decoder at lines 200
+to 214, the properties at 229 to 237 and 342 to 348), and its fixture is written by the
+matching `tools/mtd-utils/patches/130-lzma_jffs2.patch` on mtd-utils 2.3.1.
 
 YAFFS1 and YAFFS2, from Aleph One's
 [yaffs2](https://github.com/Aleph-One-Ltd/yaffs2) at commit
