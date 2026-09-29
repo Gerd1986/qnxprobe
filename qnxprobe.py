@@ -11403,8 +11403,9 @@ EXT_PARTITION_TYPES = (0x05, 0x0f, 0x85)
 # crc32(0, data, ENV_SIZE) before it reads them
 # (https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310).
 #
-# Belkin libnvram store, env_image_gemtek in a mirror of Belkin's WeMo GPL
-# release (https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
+# Belkin libnvram store, env_image_gemtek in Belkin's own libnvram source (its
+# header carries Belkin's copyright), as found in a public copy of the WeMo firmware
+# tree (https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
 # "NVRM", a CRC-32, an entry count and the offset of the end of the data, then
 # NUL-separated name=value strings. The CRC covers the partition less the
 # 16-byte header (lines 853-874); the count and end of data are written after it,
