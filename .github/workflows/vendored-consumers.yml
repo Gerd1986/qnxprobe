@@ -48,4 +48,10 @@ jobs:
             echo "::warning::some copies could not be compared, see the summary"
             exit 0
           fi
+          if [ "$status" = "3" ]; then
+            # a repository someone else owns is behind: a pull request to its
+            # owner, not something a push here can fix
+            echo "::warning::an external consumer carries an older copy, see the summary"
+            exit 0
+          fi
           exit "$status"
