@@ -575,8 +575,11 @@ attributes that overflowed into other MFT records through `$ATTRIBUTE_LIST`, and
 directory indexes in both the resident `$INDEX_ROOT` and the allocated
 `$INDEX_ALLOCATION` form, with the sector fixups put back. Bytes past a file's
 initialized size read as zero, which is what the format says and what a database that
-preallocates its file depends on. A `--list` also names any alternate data stream it
-finds, because a stream is content the file's own size does not account for.
+preallocates its file depends on. An LZNT1 compression unit that stops before it is full
+reads as zeros from there (since 1.57, see
+[NTFS compression units that stop early](#ntfs-compression-units-that-stop-early)). A
+`--list` also names any alternate data stream it finds, because a stream is content the
+file's own size does not account for.
 
 What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
 indexed beside a long one is skipped rather than listed twice, and an encrypted file is
@@ -779,6 +782,58 @@ Not exercised: a cloud file held in part, some ranges present and some with the
 provider. It is refused on its `RECALL_ON_DATA_ACCESS` attribute, because its holes are
 missing data and not zeros, and no image holding one was found; Windows would not make
 one without a provider running (`CfDehydratePlaceholder` answered `0x8007016A`).
+
+### NTFS compression units that stop early
+
+Since 1.57. An NTFS-compressed file is stored in units of 16 clusters, and a compressed
+unit is a series of LZNT1 chunks of up to 4,096 bytes of output each. A unit does not
+have to be full. A chunk header of zero ends it, and the rest of the unit is zeros.
+Until 1.57 `read_file()` returned only what had been decoded up to that point, so the
+file came back shorter than its recorded size with nothing said, and any unit after the
+short one was returned at the wrong offset.
+
+This is how ntfs-3g reads one: a zero header ends the unit
+([compress.c lines 506 to 507](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L506-L507))
+and what is left of it is filled with zeros
+([lines 683 to 685](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L683-L685)), as is a
+compressed chunk that inflates to fewer than 4,096 bytes
+([lines 668 to 676](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L668-L676)). A chunk
+that runs past the unit's stored bytes, a stored chunk that is not 4,096 bytes long and
+a back reference to before its own chunk are refused there
+([lines 522 to 523](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L522-L523),
+[531 to 533](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L531-L533),
+[626 to 627](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L626-L627)), and here
+`read_file()` raises `NtfsUnreadable` for them. Until 1.57 those three also ended the
+unit quietly.
+
+Measured on four public Windows acquisitions (three of Windows 10, one of Windows 11):
+846 NTFS-compressed files, 17,442 compressed units. 17,440 decode to a full unit and
+are byte for byte what 1.56 returned. Two stop at a zero header, one on each of two
+images, both in a OneDrive sync engine log (`SyncEngine-*.aodl`):
+
+| recorded size | stored | 1.56 returned | 1.57 returns |
+| ---: | ---: | ---: | ---: |
+| 129,947 | 73,728 | 65,536 | 129,947, the second unit as zeros |
+| 61,521 | 20,480 | 0 | 61,521, all zeros |
+
+The Sleuth Kit 4.15.0 (`icat`) returns the same bytes as 1.57 for both, by SHA-256. In
+the second file the unit's five stored clusters are not empty: the first two are zeros
+and the other three hold 11,223 non-zero bytes. By the rule above those bytes are not the
+file's content, and neither reader returns them. They are on the volume, in the clusters
+`allocation()` counts as `stored`. None of the 17,442 units met any of the three
+refusals.
+
+The self-test changes one unit of the Windows-written fixture's `lznt1/text_100000.txt`
+in three copies of the volume: the second unit's first header set to zero, the first
+unit's first header set to zero, and a second unit that opens with a back reference. The
+first two have to read to the SHA-256 `icat` gave for the same changed volumes, which is
+also what the file's own bytes give with that unit replaced by zeros. The third has to
+be refused, and `icat` stops with an error at that unit. Then it runs the first two with
+a decoder that ends the unit at the zero header and requires both to fail.
+
+Not changed: the initialized size of a compressed stream is not applied, as it is for a
+stream that is not compressed. One of the 846 files has one below its size (8,192 of
+8,448 bytes), and the bytes past it decode to zeros anyway.
 
 ### FAT32 and exFAT times are readings, and are listed as such
 
