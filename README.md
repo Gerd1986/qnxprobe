@@ -353,6 +353,10 @@ exFAT walkers hand back readings rather than instants for their times, as
 described under [FAT32 and exFAT times](#fat32-and-exfat-times-are-readings-and-are-listed-as-such);
 pass a dict as `times` to `collect()` to receive them.
 
+`allocation(walker, ino)` (since 1.56) says what the volume stores for one file beside
+the size it records, and whether it is a cloud placeholder with no content to read; see
+[What a file stores](#what-a-file-stores-cloud-placeholders-and-overlay-compression).
+
 `volumes()` reads only what identification needs. The walk and the reads happen
 when you ask for them, so a consumer that wants a few files out of a 250 GiB disk
 never touches the rest.
@@ -566,6 +570,7 @@ table for the same reason a FAT one is: it ends in `0x55AA` and its boot code si
 where partition entries would be.
 
 What it reads: resident and non-resident data, sparse runs, LZNT1 compressed data,
+files the Windows Overlay Filter compressed with XPRESS (since 1.56),
 attributes that overflowed into other MFT records through `$ATTRIBUTE_LIST`, and
 directory indexes in both the resident `$INDEX_ROOT` and the allocated
 `$INDEX_ALLOCATION` form, with the sector fixups put back. Bytes past a file's
@@ -576,6 +581,9 @@ finds, because a stream is content the file's own size does not account for.
 What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
 indexed beside a long one is skipped rather than listed twice, and an encrypted file is
 listed with its recorded size and refuses to be read, since the volume holds no key.
+Since 1.56 a cloud provider's online-only placeholder and a file overlay-compressed with
+LZX are refused the same way, for the reasons under
+[What a file stores](#what-a-file-stores-cloud-placeholders-and-overlay-compression).
 Only the unnamed stream is the file's content; the named ones are read separately, as
 [Alternate data streams](#alternate-data-streams) describes. `NtfsWalker.stamps(record)` returns
 the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
@@ -694,6 +702,83 @@ seven streams that store anything are listed, `$Extend/$UsnJrnl:$J` (21,376 byte
 byte-identical to `icat`'s reading; `$BadClus:$Bad` is left out. That journal is young
 enough to have no hole at its front, so the front-hole rule is still checked against the
 fixture's shape only.
+
+### What a file stores, cloud placeholders and overlay compression
+
+Since 1.56. The size a file records and the bytes a volume holds for it are different
+numbers for a sparse file, a compressed file and a cloud provider's placeholder, and
+`read_file()` hands back the recorded size in every case it reads, holes as zeros. A tool
+that copies files out of an image therefore writes more than the image holds, and until
+1.56 it also wrote two kinds of file that were not there at all:
+
+- **A cloud placeholder.** OneDrive with Files On-Demand, and any other sync engine built
+  on the Windows Cloud Files API, leaves a file kept online-only as a record with its full
+  size, a cloud reparse tag, and an unnamed stream in which every cluster is a hole. Read
+  as a file, it is its size in zeros. Windows itself will not read one with no provider
+  running ("The cloud file provider is not running"), and since 1.56 neither does this:
+  `read_file()` raises `NtfsUnreadable` naming the tag, the recorded size and what is
+  stored, so an extraction lists the file as not read instead of writing zeros under its
+  name. A cloud file that is all there (a hydrated placeholder) keeps its tag and reads
+  normally.
+- **An overlay-compressed file.** `compact /exe` compresses a file through the Windows
+  Overlay Filter, and Store app packages, .NET native images and Defender's platform
+  files were found compressed that way on the images below. The filter keeps the
+  same all-hole unnamed stream and puts the real content, compressed, in a stream named
+  `WofCompressedData`. Until 1.56 such a file read as zeros of the right length. It is now
+  decoded: XPRESS in 4K, 8K and 16K chunks. LZX (`compact /exe:lzx`) is not decoded and
+  is refused by name, as is a file of 4 GiB or more and one backed by WIMBoot, whose
+  content is in a WIM file elsewhere.
+
+`allocation(walker, node)` says what a volume stores for one file: `size` (what
+`read_file()` returns), `stored` (the bytes held for the content, in whole clusters, or the
+length of a resident one), `sparse`, `compression` (`lznt1`, `wof-xpress8k` and so on, or
+`decmpfs` on APFS) and `placeholder`. On NTFS it adds `reparse_tag` and `attributes`, on
+APFS `bsd_flags`. A walker that cannot say answers `None`. Total `stored` over the files
+you are about to copy to know what they occupy; total `size` to know what you will write.
+
+On APFS the stored figure is the data stream's `alloced_size` less the inode's
+sparse-bytes field. `alloced_size` alone is the logical size for a sparse file, holes
+included. Measured on a volume macOS 27 wrote: the difference equals the blocks `stat`
+reports on five of five sparse files (a 100 MB file storing 32 KB among them), and the
+figure equals `stat` on the three ordinary files beside them. `placeholder` on APFS is the
+`SF_DATALESS` flag (iCloud Drive with optimised storage sets it). That is taken from
+`sys/stat.h` and is not exercised: no image holding a dataless file has been read.
+
+Validated against a volume Windows 11 (build 26200) wrote,
+`tests/fixtures/ntfs-windows.img.gz`, built by `tools/make_ntfs_windows_fixture.cmd`:
+five files compressed with each of `compact /exe:xpress4k`, `xpress8k`, `xpress16k` and
+`lzx` (text, text of exactly 32,768 bytes, a 5,000 byte file, text around 20,000 random
+bytes, and zeros around text; 7 of the 161 XPRESS chunks are stored plain), two NTFS
+compressed files, five sparse files, a plain file, a resident file, a file with two names, three
+online-only placeholders the Cloud Files filter wrote through `CfCreatePlaceholders`, and
+one cloud file converted in place and left whole. The manifest beside it holds what
+Windows said about each: its length, its size on disk, its SHA-256, and whether Windows
+could read it. The self-test requires all 27 files Windows hashed to read to the same
+hash, the three Windows refused to be refused and to be the only placeholders, the five
+LZX files to be refused by name, and `stored` to equal Windows's size on disk on all 25
+sparse and compressed files whose content lies in clusters. Then it switches each rule
+off in turn and requires the comparison to fail: reading the unnamed stream of an
+overlay-compressed file, reading a placeholder's hole, and taking every XPRESS file to be
+in 4 KiB chunks. The algorithm numbers in the reparse point (0 XPRESS4K, 1 LZX,
+2 XPRESS8K, 3 XPRESS16K) are what that volume holds for each.
+
+On real evidence: two public Windows 10 acquisitions hold 1,873 overlay-compressed files
+between them, all XPRESS8K, and all decode to their recorded length. 843 of them are
+executables carrying an Authenticode signature, and the digest computed from the decoded
+bytes is in the signature on every one. 43 more match the checksum in their PE header.
+27 differ from that checksum and carry nothing else to check them against; 34 of the 843
+differ from it the same way and are proven by their signatures, so a stale header
+checksum is something those files have. A public Windows 11 acquisition holds four LZX
+files, which are refused, and one OneDrive file kept online-only: 1,151,898 bytes
+recorded, none stored, reparse tag `0x9000401A`, the attributes `SPARSE_FILE`,
+`REPARSE_POINT`, `OFFLINE` and `RECALL_ON_DATA_ACCESS`, the tag and the four attributes
+the fixture's placeholders carry. It read as 1,151,898 zero bytes before 1.56 and is
+refused now.
+
+Not exercised: a cloud file held in part, some ranges present and some with the
+provider. It is refused on its `RECALL_ON_DATA_ACCESS` attribute, because its holes are
+missing data and not zeros, and no image holding one was found; Windows would not make
+one without a provider running (`CfDehydratePlaceholder` answered `0x8007016A`).
 
 ### FAT32 and exFAT times are readings, and are listed as such
 
@@ -1714,6 +1799,24 @@ Encrypt-on-Write map                             libbde/libbde_volume.c:1668
 bytes per sector from the moved header           libbde/libbde_volume.c:1497-1506
 ```
 
+NTFS reparse points, cloud placeholders and overlay compression, from Microsoft:
+
+```
+reparse tags (IO_REPARSE_TAG_WOF, _CLOUD to _CLOUD_F)   [MS-FSCC] 2.1.2.1
+file attributes (SPARSE_FILE, OFFLINE,
+RECALL_ON_DATA_ACCESS)                                  [MS-FSCC] 2.6
+overlay reparse data: version, provider, then the
+file provider's version and algorithm                   WOF_EXTERNAL_INFO,
+                                                        FILE_PROVIDER_EXTERNAL_INFO_V1
+XPRESS chunk sizes, LZX's 32 KB                         WOF_FILE_COMPRESSION_INFO_V1
+LZ77+Huffman block: 256 bytes of code lengths for
+512 symbols, then the symbols                           [MS-XCA] 2.1
+```
+
+The algorithm numbers, the chunk table of the `WofCompressedData` stream and the order
+of the decoder's reads are checked against files Windows wrote and Windows's own hashes
+of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
+
 `--help` prints this same sourcing, so it travels with the tool.
 
 ## What it does not do
@@ -1752,6 +1855,10 @@ bytes per sector from the moved header           libbde/libbde_volume.c:1497-150
   protected only by a TPM is named and not read.
   On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
   its content refused rather than guessed at.
+- **Overlay compression with LZX is recognised but not read.** A file compressed with
+  `compact /exe:lzx` is listed with its recorded size and refused by name; the three
+  XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
+  on the volume and is refused too, rather than written out as zeros.
 - **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
   LZO or zstd clusters is listed with its recorded size and not decompressed.
 - **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
