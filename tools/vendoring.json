@@ -6,7 +6,14 @@
     "",
     "Add a consumer here in the same change that first vendors the file, or the",
     "check is silent about it forever. A missing consumer is the one failure this",
-    "registry has, and nothing else can detect it."
+    "registry has, and nothing else can detect it.",
+    "",
+    "A consumer names either its manifest (a vendored.json recording the sha256 of",
+    "its copy) or, where it keeps no manifest, the copy itself: a copy may carry a",
+    "comment header above the upstream file, and is current when the upstream bytes",
+    "are its tail. external marks a repository someone else owns. One that is behind",
+    "is reported and does not fail the check, because the fix is a pull request its",
+    "owner has to merge."
   ],
   "upstreams": [
     {
@@ -19,7 +26,10 @@
         {"repo": "abrignoni/ALEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/DLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
-        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"}
+        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "stark4n6/Arc2Lite", "manifest": "vendor/vendored.json", "external": true},
+        {"repo": "kalink0/crush-forensics", "copy": "crush/third_party/qnxprobe/qnxprobe.py",
+         "external": true}
       ]
     },
     {
@@ -33,7 +43,10 @@
         {"repo": "abrignoni/ALEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/DLEAPP", "manifest": "scripts/vendor/vendored.json"},
         {"repo": "abrignoni/iLEAPP", "manifest": "scripts/vendor/vendored.json"},
-        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"}
+        {"repo": "abrignoni/RLEAPP", "manifest": "scripts/vendor/vendored.json"},
+        {"repo": "stark4n6/Arc2Lite", "manifest": "vendor/vendored.json", "external": true},
+        {"repo": "kalink0/crush-forensics", "copy": "crush/third_party/ewfprobe/ewfprobe.py",
+         "external": true}
       ]
     },
     {

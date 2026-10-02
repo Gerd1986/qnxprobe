@@ -8,7 +8,9 @@ consumers, and nothing in a consumer notices the day upstream changes.
 
 This reads tools/vendoring.json, takes the current bytes of each upstream file,
 and compares them against the sha256 every consumer recorded in its own
-vendored.json.
+vendored.json. A consumer that keeps no manifest names its copy instead: the
+copy may carry a comment header above the upstream file, and is current when the
+upstream bytes are its tail.
 
     python3 tools/check_consumers.py                    # over the network
     python3 tools/check_consumers.py --local ..         # from checkouts beside this one
@@ -19,8 +21,14 @@ are different results: one says a copy is stale, the other says nothing was
 compared, and folding the second into the first turns an unreachable network
 into a finding that reads like a defect.
 
-Exit 0 every consumer is current, 1 at least one is behind, 2 nothing was
-behind but something could not be checked.
+A consumer marked external is a repository someone else owns. One that is
+behind is listed on its own and does not fail the check: re-vendoring it is a
+pull request its owner has to merge, and a job that stays red until a stranger
+acts stops being read.
+
+Exit 0 every consumer is current, 1 at least one of our own is behind, 3 only
+external consumers are behind, 2 nothing was behind but something could not be
+checked.
 """
 
 from __future__ import annotations
@@ -29,6 +37,7 @@ import argparse
 import hashlib
 import json
 import os
+import re
 import sys
 import urllib.error
 import urllib.request
@@ -97,6 +106,19 @@ def _recorded(manifest: bytes, name: str) -> dict:
     raise Unavailable(f"the manifest records no entry named {name!r}")
 
 
+def _copy_state(copy: bytes, upstream: bytes) -> tuple[bool, str]:
+    """(current, version) for a consumer that keeps the file under a header.
+
+    The copy is current when the upstream bytes are its tail, so whatever the
+    consumer wrote above them is its own business. The version is the tag its
+    header names ("tag v1.38"), read from the top of the copy, or "?".
+    """
+    current = copy.endswith(upstream)
+    head = copy[:len(copy) - len(upstream)] if current else copy[:4096]
+    tag = re.search(rb"tag v([0-9][0-9.]*[0-9])", head)
+    return current, tag.group(1).decode("ascii") if tag else "?"
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -115,6 +137,7 @@ def main() -> int:
         return _read_local(args.local, repo, path) if args.local else _fetch(repo, path)
 
     behind: list[str] = []
+    behind_external: list[str] = []
     unknown: list[str] = []
     current: list[str] = []
     rows: list[tuple[str, str, str, str]] = []
@@ -122,27 +145,39 @@ def main() -> int:
     for up in registry["upstreams"]:
         name, repo, path = up["name"], up["repo"], up["file"]
         try:
-            want = _sha256(get(repo, path))
+            upstream = get(repo, path)
+            want = _sha256(upstream)
         except Unavailable as exc:
             unknown.append(f"{name}: the upstream file could not be read ({exc})")
             rows.append((name, repo, "?", "upstream unreadable"))
             continue
         for consumer in up["consumers"]:
-            crepo, cpath = consumer["repo"], consumer["manifest"]
+            crepo = consumer["repo"]
+            external = bool(consumer.get("external"))
             label = f"{name} in {crepo}"
             try:
-                entry = _recorded(get(crepo, cpath), name)
+                if "copy" in consumer:
+                    same, ver = _copy_state(get(crepo, consumer["copy"]), upstream)
+                    got = "its copy does not end with the upstream file"
+                else:
+                    entry = _recorded(get(crepo, consumer["manifest"]), name)
+                    got = entry.get("sha256", "")
+                    ver = entry.get("version", "?")
+                    same = got == want
+                    got = got[:12] or "no sha"
             except Unavailable as exc:
                 unknown.append(f"{label}: {exc}")
                 rows.append((name, crepo, "?", "not compared"))
                 continue
-            got = entry.get("sha256", "")
-            ver = entry.get("version", "?")
-            if got == want:
+            if same:
                 current.append(f"{label}: {ver}")
                 rows.append((name, crepo, ver, "current"))
+            elif external:
+                behind_external.append(f"{label}: has {ver} ({got}), "
+                                       f"upstream is {want[:12]}")
+                rows.append((name, crepo, ver, "behind (external)"))
             else:
-                behind.append(f"{label}: has {ver} ({got[:12] or 'no sha'}), "
+                behind.append(f"{label}: has {ver} ({got}), "
                               f"upstream is {want[:12]}")
                 rows.append((name, crepo, ver, "**BEHIND**"))
 
@@ -152,12 +187,22 @@ def main() -> int:
         out += [f"  {b}" for b in behind]
         out.append("")
         out.append("Re-vendor each of those, then update its vendored.json.")
+    elif behind_external:
+        if current:
+            out.append(f"No consumer of ours is behind ({len(current)} copies current).")
     elif current:
         out.append(f"Every consumer is current ({len(current)} checked).")
     else:
         # nothing was behind because nothing was looked at, which is not the
         # same sentence and must not be printed as though it were
         out.append("Nothing was compared.")
+    if behind_external:
+        if out:
+            out.append("")
+        out.append("Behind, in a repository someone else owns:\n")
+        out += [f"  {b}" for b in behind_external]
+        out.append("")
+        out.append("Each of those takes a pull request to its owner.")
     if unknown:
         out.append("")
         out.append("Not compared, so nothing is claimed about these:\n")
@@ -175,6 +220,8 @@ def main() -> int:
 
     if behind:
         return 1
+    if behind_external:
+        return 3
     return 2 if unknown else 0
 
 
