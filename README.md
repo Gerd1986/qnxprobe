@@ -453,6 +453,60 @@ needs, not mapped, or at odds with its superblock returns an empty list, which i
 answer" and not "nothing free". The walker reads little-endian volumes; all four
 measured are little endian.
 
+## Writing free space to files
+
+Since 1.58 `--unallocated DIR` copies out the free space of every volume whose filesystem
+says what is free: qnx6, F2FS, FAT32, exFAT, NTFS, HFS+ and APFS.
+
+```
+python3 qnxprobe.py --unallocated free_space --only dps_mfg mmcblk0.img
+```
+
+For each such volume it writes `<image>.<volume>.unallocated.bin`, the free runs one after
+another, and a `.tsv` beside it with one line per run: where the run starts in that file,
+where it came from in the image, and its length. A carve hit at an offset in the `.bin`
+maps back to the disk through that table. `unallocated.json` lists every volume looked at,
+what was done with it, and the SHA-256 of each file written. Offsets are into the image
+as qnxprobe reads it, so for an E01, an AFF, a disk image or a split set they are offsets
+into the disk and not into the container file.
+
+What it writes and what it leaves out:
+
+- **A filesystem that does not report free space gets no file.** ext2/3/4, QNX4, ETFS,
+  EFS, SquashFS, JFFS2, UBI/UBIFS, YAFFS and QNX IFS readers have no free-space call. The
+  volume is listed as `not written: the ext4 reader does not report free space`.
+- **An empty answer gets no file, and is not called "nothing free".** A reader returns
+  the same empty list when it cannot read its allocation map and when the volume is full,
+  so the status is `no free space reported (the allocation map could not be read, or
+  nothing is free)`.
+- **A run past the end of a partial image is cut there.** The FAT32 reader, on an image
+  cut short, reports clusters past the end of the file as free. On the committed FAT32
+  fixture cut to 3,000,000 bytes, 1.8 MiB was written and 61.1 MiB was counted as lying
+  past the end and not written.
+- **An APFS container's free space is the container's**, not one volume's, so it is one
+  file per container. It is copied as stored: blocks an encrypted volume wrote there stay
+  encrypted, with or without its password, and the output says when the container holds
+  an encrypted volume.
+- **A BitLocker volume that was opened is read through its decryption**, the same handle
+  file reads use. No test image here pairs BitLocker with a filesystem that reports free
+  space, so that path has not been run.
+- **Space outside every recognised volume is not written.** Gaps between partitions,
+  reserved partitions and an unpartitioned tail are no filesystem's free space.
+- **Nothing is overwritten.** DIR must be new or empty, and a volume whose output would
+  not fit in the room DIR has is listed and skipped.
+
+`--only` applies, as it does to `--extract`. The output can be nearly as large as the
+disk: the Ford Sync G4 `storage` volume has 3,716,776 free blocks, about 14.2 GiB.
+
+On the two small qnx6 volumes measured above (qnxmount's reference image and Sync G4
+`dps_mfg`) the `.bin` is byte-identical, by SHA-256, to the dump the second qnx6 reader
+writes. One committed fixture per other filesystem was run through it: F2FS, FAT32, exFAT,
+NTFS, HFS+ and APFS each wrote a file, and the ext4 and SquashFS ones were listed as not
+reporting free space.
+
+From Python the same writer is `write_unallocated(fh, size, volumes(fh, size), out_dir,
+image_name)`.
+
 ## APFS
 
 Every Mac since 2017 is APFS, so `--list` and `--extract` read a container. It is
@@ -1631,7 +1685,8 @@ reported as not recognised, with its first bytes shown.
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
-| `--only TEXT` | Restrict `--list` and `--extract` to partitions whose name or label contains TEXT |
+| `--unallocated DIR` | Write the free space of every volume whose filesystem reports it into DIR, with a map back to the image. See [Writing free space to files](#writing-free-space-to-files) |
+| `--only TEXT` | Restrict `--list`, `--extract` and `--unallocated` to partitions whose name or label contains TEXT |
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
