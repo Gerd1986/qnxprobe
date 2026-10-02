@@ -392,6 +392,121 @@ and differ on 4 entries of 313,652 on one acquisition where the volume's own
 index and records disagree, and on 3 on another. `NtfsWalker.listing` says which
 and what is known about why. `collect()` is unchanged.
 
+## QNX6 free space
+
+Since 1.58 `Qnx6Walker.free_extents()` reports the space a qnx6 volume says is free, as
+`(byte offset into the image, length)` runs. It is the call the F2FS, FAT32, exFAT, NTFS,
+HFS+ and APFS walkers already answer, so a carve can be scoped to free space on a qnx6
+volume the same way.
+
+```python
+import qnxprobe as q
+
+image = q.open_image(path)
+for vol in q.volumes(image):
+    if vol["kind"] != "qnx6" or vol.get("walker") is None:
+        continue
+    for offset, length in vol["walker"].free_extents(min_bytes=1 << 20):
+        data = q.read_at(image, offset, min(length, 1 << 20))   # the run's first bytes
+image.close()
+```
+
+The bitmap is a tree under the Bitmap root node of the superblock, the second root node
+of `struct qnx6_super_block`
+([qnx6_fs.h line 111](https://github.com/torvalds/linux/blob/d56b699d76d1b352f7a3d3a0a3e91c79b8612d94/include/linux/qnx6_fs.h#L111)). The kernel's description of
+it ([qnx6.rst lines 156 to 165](https://github.com/torvalds/linux/blob/d56b699d76d1b352f7a3d3a0a3e91c79b8612d94/Documentation/filesystems/qnx6.rst#L156-L165))
+gives one bit per block, block 0 where file blocks start, and the bits past the last
+block set. It does not say which bit value means in use or which end of a byte is counted
+first, and the Linux driver, which has no write path, never reads the bitmap. Both were
+measured, on the four qnx6 volumes at hand: qnxmount's reference image and the three qnx6
+partitions of a Ford Sync G4 image. Live blocks below are every block named by the
+superblock's root nodes and by every inode whose status is directory or normal file.
+
+| volume | blocks | block size | free runs | free blocks | `sb_free_blocks` | live blocks | live blocks inside a free run | the same, most significant bit first |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| qnxmount `test_image.bin` | 384 | 1,024 | 2 | 339 | 339 | 38 | 0 | 5 |
+| Sync G4 `dps_mfg` | 1,020 | 4,096 | 2 | 965 | 965 | 50 | 0 | 4 |
+| Sync G4 `dps_os` | 6,140 | 4,096 | 3 | 6,055 | 6,055 | 59 | 0 | 2 |
+| Sync G4 `storage` | 7,541,755 | 4,096 | 5,422 | 3,716,776 | 3,716,776 | 3,822,697 | 0 | 10,445 |
+
+A set bit is a block in use, and bit 0 is the least significant bit of byte 0. Read that
+way the clear bits equal the superblock's own `sb_free_blocks` on all four volumes and no
+live block is clear. The count cannot settle the bit order (on the reference image both
+orders give 339); position does, and read from the top of each byte live blocks fall in
+free space on every volume. A second qnx6 reader, written independently of this one,
+names the same set of free blocks on the three volumes it opens, and its dump of them is
+byte-identical by SHA-256 on the two small ones.
+
+Live and free blocks do not add up to the volume. 7, 5, 26 and 2,282 blocks are marked in
+use and named by no live inode or root node. qnx6.rst describes a preallocated system
+area in the bitmap; whether that accounts for them was not established. They are not
+reported as free.
+
+The bitmap read is the one of the superblock the walker was opened on, the newest
+generation. Blocks that only the previous generation's trees name can be clear in it (1,
+1 and 7 blocks on the three volumes that hold two generations), so a reported run can
+hold what the last commit replaced.
+
+Nothing is reported unless the whole bitmap can be read and its clear bits equal
+`sb_free_blocks`. A bitmap that is cut short by a partial image, shorter than the volume
+needs, not mapped, or at odds with its superblock returns an empty list, which is "no
+answer" and not "nothing free". The walker reads little-endian volumes; all four
+measured are little endian.
+
+## Writing free space to files
+
+Since 1.58 `--unallocated DIR` copies out the free space of every volume whose filesystem
+says what is free: qnx6, F2FS, FAT32, exFAT, NTFS, HFS+ and APFS.
+
+```
+python3 qnxprobe.py --unallocated free_space --only dps_mfg mmcblk0.img
+```
+
+For each such volume it writes `<image>.<volume>.unallocated.bin`, the free runs one after
+another, and a `.tsv` beside it with one line per run: where the run starts in that file,
+where it came from in the image, and its length. A carve hit at an offset in the `.bin`
+maps back to the disk through that table. `unallocated.json` lists every volume looked at,
+what was done with it, and the SHA-256 of each file written. Offsets are into the image
+as qnxprobe reads it, so for an E01, an AFF, a disk image or a split set they are offsets
+into the disk and not into the container file.
+
+What it writes and what it leaves out:
+
+- **A filesystem that does not report free space gets no file.** ext2/3/4, QNX4, ETFS,
+  EFS, SquashFS, JFFS2, UBI/UBIFS, YAFFS and QNX IFS readers have no free-space call. The
+  volume is listed as `not written: the ext4 reader does not report free space`.
+- **An empty answer gets no file, and is not called "nothing free".** A reader returns
+  the same empty list when it cannot read its allocation map and when the volume is full,
+  so the status is `no free space reported (the allocation map could not be read, or
+  nothing is free)`.
+- **A run past the end of a partial image is cut there.** The FAT32 reader, on an image
+  cut short, reports clusters past the end of the file as free. On the committed FAT32
+  fixture cut to 3,000,000 bytes, 1.8 MiB was written and 61.1 MiB was counted as lying
+  past the end and not written.
+- **An APFS container's free space is the container's**, not one volume's, so it is one
+  file per container. It is copied as stored: blocks an encrypted volume wrote there stay
+  encrypted, with or without its password, and the output says when the container holds
+  an encrypted volume.
+- **A BitLocker volume that was opened is read through its decryption**, the same handle
+  file reads use. No test image here pairs BitLocker with a filesystem that reports free
+  space, so that path has not been run.
+- **Space outside every recognised volume is not written.** Gaps between partitions,
+  reserved partitions and an unpartitioned tail are no filesystem's free space.
+- **Nothing is overwritten.** DIR must be new or empty, and a volume whose output would
+  not fit in the room DIR has is listed and skipped.
+
+`--only` applies, as it does to `--extract`. The output can be nearly as large as the
+disk: the Ford Sync G4 `storage` volume has 3,716,776 free blocks, about 14.2 GiB.
+
+On the two small qnx6 volumes measured above (qnxmount's reference image and Sync G4
+`dps_mfg`) the `.bin` is byte-identical, by SHA-256, to the dump the second qnx6 reader
+writes. One committed fixture per other filesystem was run through it: F2FS, FAT32, exFAT,
+NTFS, HFS+ and APFS each wrote a file, and the ext4 and SquashFS ones were listed as not
+reporting free space.
+
+From Python the same writer is `write_unallocated(fh, size, volumes(fh, size), out_dir,
+image_name)`.
+
 ## APFS
 
 Every Mac since 2017 is APFS, so `--list` and `--extract` read a container. It is
@@ -1570,7 +1685,8 @@ reported as not recognised, with its first bytes shown.
 | `--depth N` | How deep to walk with `--list` (default 2) |
 | `--list-max N` | Stop after this many entries per filesystem (default 400) |
 | `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
-| `--only TEXT` | Restrict `--list` and `--extract` to partitions whose name or label contains TEXT |
+| `--unallocated DIR` | Write the free space of every volume whose filesystem reports it into DIR, with a map back to the image. See [Writing free space to files](#writing-free-space-to-files) |
+| `--only TEXT` | Restrict `--list`, `--extract` and `--unallocated` to partitions whose name or label contains TEXT |
 | `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
 | `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
 | `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
