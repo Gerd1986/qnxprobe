@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.57"
+QNXPROBE_VERSION = "1.58"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -1206,7 +1206,7 @@ def _e(sb, k, n=4):
 QNX6_INODE_SIZE  = 0x80
 QNX6_DIRENT_SIZE = 0x20
 QNX6_ROOT_INO    = 1
-QNX6_ROOTNODE    = dict(Inode=72, Longfile=232)   # offsets inside the superblock
+QNX6_ROOTNODE    = dict(Inode=72, Bitmap=152, Longfile=232)   # offsets inside the superblock
 S_IFDIR, S_IFLNK = 0o040000, 0o120000
 S_IFMT, S_IFREG = 0o170000, 0o100000     # the format bits, and a regular file
 
@@ -1254,6 +1254,11 @@ class Qnx6Walker:
         self.blks_off = (0x2000 >> bits) + (0x1000 >> bits)
         self.inode_rn = self._rn(sb, QNX6_ROOTNODE["Inode"])
         self.long_rn = self._rn(sb, QNX6_ROOTNODE["Longfile"])
+        # what free_extents() reads: sb_num_blocks, sb_free_blocks and the
+        # Bitmap root node with its size in bytes
+        self.num_blocks, self.free_blocks = struct.unpack_from("<II", sb, F["num_blocks"])
+        self.bitmap_rn = self._rn(sb, QNX6_ROOTNODE["Bitmap"])
+        self.bitmap_bytes = struct.unpack_from("<Q", sb, QNX6_ROOTNODE["Bitmap"])[0]
 
     @staticmethod
     def _rn(sb, o):
@@ -1351,6 +1356,72 @@ class Qnx6Walker:
             left -= take
             if left <= 0:
                 return
+
+    def free_extents(self, min_bytes=0):
+        """[(byte offset, length)] for the runs of space the volume says are free.
+
+        qnx6 keeps one bit per block in a tree under the Bitmap root node, the
+        second root node of struct qnx6_super_block (include/linux/qnx6_fs.h).
+        Documentation/filesystems/qnx6.rst gives the numbering: each bit is one
+        filesystem block, block 0 is where file blocks start (blks_off here), and
+        the bits past the last block are set. The Linux driver has no write path
+        and never reads the bitmap, so two things are measured rather than
+        sourced: a set bit is a block in use, and bit 0 is the least significant
+        bit of byte 0. See "QNX6 free space" in the README for the measurement:
+        read that way, on four volumes, the clear bits equal the superblock's own
+        sb_free_blocks and no block a live file or metadata tree occupies is
+        clear; read most-significant-first, live blocks land in free space on
+        every one of them.
+
+        The bitmap is the one of the superblock this walker was opened on, the
+        newest generation. Nothing is reported unless that bitmap can be read for
+        every block and its clear bits equal sb_free_blocks: a bitmap that is cut
+        short, unmapped, or at odds with its own superblock is no answer, and is
+        not turned into one.
+
+        Offsets are into the image rather than the volume, so a caller reading
+        the whole disk can use them directly. ``min_bytes`` drops runs too short
+        to hold anything worth recovering.
+        """
+        nb, bs = self.num_blocks, self.bs
+        need = (nb + 7) // 8
+        if not nb or self.bitmap_bytes < need:
+            return []
+        raw = bytearray()
+        for lb in range((need + bs - 1) // bs):
+            b = self._map(self.bitmap_rn["ptr"], self.bitmap_rn["levels"], lb)
+            buf = self._blk(b) if b is not None else b""
+            if len(buf) < bs:
+                return []
+            raw += buf
+        del raw[need:]
+        if nb & 7:
+            # the last byte's bits past sb_num_blocks are not blocks
+            raw[-1] |= (0xFF << (nb & 7)) & 0xFF
+        if need * 8 - bin(int.from_bytes(raw, "little")).count("1") != self.free_blocks:
+            return []
+        runs, start = [], None
+        for i, val in enumerate(raw):
+            if val == 0xFF:
+                if start is not None:
+                    runs.append((start, i * 8))
+                    start = None
+            elif val == 0:
+                if start is None:
+                    start = i * 8
+            else:
+                for k in range(8):
+                    if (val >> k) & 1:
+                        if start is not None:
+                            runs.append((start, i * 8 + k))
+                            start = None
+                    elif start is None:
+                        start = i * 8 + k
+        if start is not None:
+            runs.append((start, nb))
+        first = self.base + self.blks_off * bs
+        return [(first + s * bs, (e - s) * bs) for s, e in runs
+                if (e - s) * bs >= min_bytes]
 
     root = QNX6_ROOT_INO
 
@@ -16834,6 +16905,62 @@ def self_test():
         _nobm[_ex_root - 32] = 0x85                  # and the TexFAT one with it
         exfat_no_bitmap_ok = ExfatWalker(io.BytesIO(bytes(_nobm)), 0).free_extents() == []
 
+        # A qnx6 volume's free space. 512-byte blocks, 4,997 of them, so the
+        # bitmap is 625 bytes: two blocks, reached through one indirect block.
+        # That indirect block is stored block 0, as it is on the Ford Sync G4
+        # storage volume, and the volume starts 4,096 bytes into the image so an
+        # offset into the volume cannot pass for one into the image. The bytes
+        # that decide the bit order are written out, not built with the shift the
+        # reader uses: block 7 is the top bit of byte 0, blocks 8 and 9 the two
+        # low bits of byte 1. A reader counting from the top of each byte calls
+        # block 0 and blocks 14 and 15 free instead. The three bits past the last
+        # block are set, as the kernel's qnx6.rst says a real bitmap has them.
+        Q6_BASE, Q6_BS, Q6_BLOCKS, Q6_DATA = 4096, 512, 4997, 0x3000
+        Q6_WANT = [(7, 3), (4000, 201), (4990, 7)]             # (first block, blocks)
+
+        def _q6_image(free_blocks=211, padding_set=True, second_ptr=9, cut=None,
+                      blocks=Q6_BLOCKS, bitmap_bytes=625):
+            img = bytearray(Q6_BASE + Q6_DATA + 16 * Q6_BS)
+            sbo = Q6_BASE + BOOTBLOCK_SIZE
+            img[sbo:sbo + 4] = TRUE_MAGIC_LE
+            struct.pack_into("<I", img, sbo + 48, Q6_BS)
+            struct.pack_into("<II", img, sbo + 60, blocks, free_blocks)
+            struct.pack_into("<Q", img, sbo + 152, bitmap_bytes)   # Bitmap root node: size,
+            struct.pack_into("<16I", img, sbo + 160, 0, *([0xFFFFFFFF] * 15))
+            img[sbo + 152 + 72] = 1                            # sixteen pointers, levels
+            struct.pack_into("<128I", img, Q6_BASE + Q6_DATA, 3, second_ptr,
+                             *([0xFFFFFFFF] * 126))
+            bm = bytearray(b"\xff" * 625)
+            bm[0], bm[1] = 0x7F, 0xFC
+            for blk in list(range(4000, 4201)) + list(range(4990, 4997)):
+                bm[blk >> 3] &= ~(1 << (blk & 7)) & 0xFF
+            if not padding_set:
+                bm[624] &= 0x1F                                # bits 4997..4999 clear
+            at = Q6_BASE + Q6_DATA + 3 * Q6_BS
+            img[at:at + 512] = bm[:512]
+            at = Q6_BASE + Q6_DATA + 9 * Q6_BS
+            img[at:at + 113] = bm[512:]
+            return Qnx6Walker(io.BytesIO(bytes(img[:cut])), Q6_BASE, BOOTBLOCK_SIZE)
+
+        _q6_runs = [(Q6_BASE + Q6_DATA + b * Q6_BS, n * Q6_BS) for b, n in Q6_WANT]
+        qnx6_free_ok = _q6_image().free_extents() == _q6_runs
+        qnx6_floor_ok = _q6_image().free_extents(min_bytes=4 * Q6_BS) == _q6_runs[1:]
+        # bits past the last block are not blocks, whatever they hold
+        qnx6_padding_ok = _q6_image(padding_set=False).free_extents() == _q6_runs
+        # and when the last block is the last bit of the bitmap, a run that is
+        # still open there ends at it: 5,000 blocks, those three bits now blocks
+        qnx6_last_bit_ok = (_q6_image(free_blocks=214, padding_set=False, blocks=5000)
+                            .free_extents()
+                            == _q6_runs[:2] + [(Q6_BASE + Q6_DATA + 4990 * Q6_BS, 10 * Q6_BS)])
+        # a bitmap at odds with its superblock, one whose root node is too short
+        # for the volume, one whose second block is not mapped, and one the image
+        # ends before, each say nothing
+        qnx6_refused_ok = (_q6_image(free_blocks=212).free_extents() == []
+                           and _q6_image(bitmap_bytes=624).free_extents() == []
+                           and _q6_image(second_ptr=0xFFFFFFFF).free_extents() == []
+                           and _q6_image(cut=Q6_BASE + Q6_DATA + 9 * Q6_BS + 100)
+                           .free_extents() == [])
+
         # The first segment of a split acquisition holds the boot sector and
         # stops. Both FAT readers follow a chain by reading four bytes per
         # cluster, and past the end of the file that read comes back short, so
@@ -16919,6 +17046,16 @@ def self_test():
                  "clusters out of it", exfat_free_ok),
                 ("an exFAT volume whose root names no bitmap reports nothing "
                  "rather than nothing free", exfat_no_bitmap_ok),
+                ("a qnx6 volume reads its free blocks out of the bitmap tree, least "
+                 "significant bit first, as offsets into the image", qnx6_free_ok),
+                ("a qnx6 free-space floor drops the short runs", qnx6_floor_ok),
+                ("qnx6 bitmap bits past the last block are never reported, set or "
+                 "clear", qnx6_padding_ok),
+                ("a qnx6 free run still open at the bitmap's last bit ends at the "
+                 "last block", qnx6_last_bit_ok),
+                ("a qnx6 bitmap that disagrees with its superblock, is too short, is "
+                 "not mapped, or is cut off reports nothing rather than nothing free",
+                 qnx6_refused_ok),
                 ("a FAT or exFAT volume cut short by a split acquisition answers "
                  "rather than raising", fat_truncated_ok),
                 ("a FAT date and time decode to the reading they store, with no "
