@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.61"
+QNXPROBE_VERSION = "1.62-datalight"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -20157,6 +20157,18 @@ if __name__ == "__main__":
     ap.add_argument("--self-test", action="store_true",
                     help="build throwaway positive and negative images, confirm "
                          "the detector reports both ways, then delete them")
+    ap.add_argument("--datalight", action="store_true",
+                    help="reconstruct a raw Datalight FlashFX/VBF NAND dump and its "
+                         "Reliance Nitro volumes (currently the validated 4320-byte "
+                         "raw-page / Nitro 2.7.1 layout)")
+    ap.add_argument("--datalight-output", default="datalight_recovered", metavar="DIR",
+                    help="output directory for --datalight (default: datalight_recovered)")
+    ap.add_argument("--write-flashfx", action="store_true",
+                    help="with --datalight, also write reconstructed FlashFX logical images")
+    ap.add_argument("--write-reliance", action="store_true",
+                    help="with --datalight, also write standalone Reliance logical images")
+    ap.add_argument("--placeholders", action="store_true",
+                    help="with --datalight, create placeholders for unreconstructed payloads")
     ap.add_argument("--list", action="store_true",
                     help="walk each filesystem found and list its contents "
                          "(qnx6, qnx4, ext2/3/4, FAT32, exFAT, NTFS, HFS+, APFS, ETFS and EFS)")
@@ -20217,6 +20229,26 @@ if __name__ == "__main__":
     if args.self_test:
         print("\nqnxprobe self-test\n")
         sys.exit(self_test())
+
+    if args.datalight:
+        if not args.image:
+            ap.error("--datalight needs a raw NAND image")
+        if len(args.image) != 1:
+            ap.error("--datalight currently accepts one raw NAND image at a time")
+        import datalight_reliance
+        old_argv = sys.argv[:]
+        try:
+            sys.argv = ["datalight_reliance.py", args.image[0], "-o", args.datalight_output]
+            if args.write_flashfx:
+                sys.argv.append("--write-flashfx")
+            if args.write_reliance:
+                sys.argv.append("--write-reliance")
+            if args.placeholders:
+                sys.argv.append("--placeholders")
+            datalight_reliance.main()
+        finally:
+            sys.argv = old_argv
+        sys.exit(0)
 
     if not args.image:
         ap.print_help()
