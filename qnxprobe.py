@@ -20157,6 +20157,8 @@ if __name__ == "__main__":
     ap.add_argument("--self-test", action="store_true",
                     help="build throwaway positive and negative images, confirm "
                          "the detector reports both ways, then delete them")
+    ap.add_argument("--qualcomm-kombox", action="store_true",
+                    help="preprocess a 4352-byte/page Qualcomm Kommbox NAND: BCH m=13 t=8 ECC correction, remove stuff/ECC/spare bytes, then run normal filesystem discovery on 4096-byte pages")
     ap.add_argument("--datalight", action="store_true",
                     help="reconstruct a raw Datalight FlashFX/VBF NAND dump and its "
                          "Reliance Nitro volumes (currently the validated 4320-byte "
@@ -20257,6 +20259,34 @@ if __name__ == "__main__":
     missing = [p for p in args.image if not os.path.exists(p)]
     if missing:
         sys.exit("not found: " + ", ".join(missing))
+
+    # Qualcomm Kommbox raw NAND: correct BCH and strip the interleaved
+    # stuff/ECC/spare bytes before the normal UBI/UBIFS/SquashFS discovery.
+    # Originals remain read-only; temporary logical images are removed at exit.
+    if args.qualcomm_kombox:
+        if args.datalight:
+            ap.error("--qualcomm-kombox and --datalight are separate raw-NAND layouts")
+        import atexit
+        import qualcomm_kombox
+        converted = []
+        temps = []
+        for p in args.image:
+            def _kp(done, total, corr, bad, _p=p):
+                if done == total or done % 8192 == 0:
+                    print(f"Qualcomm-Kombox: {os.path.basename(_p)} {done:,}/{total:,} pages, "
+                          f"{corr:,} corrected bit(s), {bad:,} uncorrectable codeword(s)",
+                          file=sys.stderr, flush=True)
+            out, stats = qualcomm_kombox.preprocess(p, progress=_kp)
+            converted.append(out); temps.append(out)
+            print(f"Qualcomm-Kombox preprocessing: {stats['pages']:,} pages, "
+                  f"{stats['corrected_bits']:,} corrected bit(s), "
+                  f"{stats['uncorrectable_codewords']:,} uncorrectable codeword(s)")
+        args.image = converted
+        def _cleanup_kombox():
+            for p in temps:
+                try: os.remove(p)
+                except OSError: pass
+        atexit.register(_cleanup_kombox)
 
     given_passwords = _cli_passwords(args.password_file, args.password_env)
 
