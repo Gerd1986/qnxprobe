@@ -120,7 +120,7 @@ def run_window(initial_paths):
     # passwords: an encrypted image's password, by path, once it has opened the
     # image; kept in memory for this window only, never written anywhere
     state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={},
-                 bl_secrets={}, bl_keys={}, aff_keys={})
+                 bl_secrets={}, bl_keys={}, aff_keys={}, kombox_temp=None)
 
     def ask_password(path, wrong):
         """The password for an encrypted image, asked for on the main thread, or None
@@ -595,7 +595,7 @@ def run_window(initial_paths):
             return
         # A raw Datalight NAND must not go through the normal BitLocker/APFS
         # volume discovery first; that is both irrelevant and very expensive.
-        if not v_datalight.get() and not unlock_volumes(path):
+        if not v_datalight.get() and not v_kombox.get() and not unlock_volumes(path):
             done_loading()
             return
 
@@ -610,13 +610,23 @@ def run_window(initial_paths):
                     vols = dl.gui_volumes(path)
                     q_con.put(("datalight", path, None, vols))
                 else:
-                    fh = q.open_image(path, password=state["passwords"].get(path),
+                    open_path = path
+                    if v_kombox.get():
+                        import qualcomm_kombox
+                        def kp(done, total, corr, bad):
+                            if done == total or done % 8192 == 0:
+                                q_con.put(("status", path, None,
+                                           f"Qualcomm-Kombox {done:,}/{total:,} pages; {corr:,} corrected bits; {bad:,} bad codewords"))
+                        open_path, _stats = qualcomm_kombox.preprocess(path, progress=kp)
+                        state["kombox_temp"] = open_path
+                    fh = q.open_image(open_path, password=state["passwords"].get(path),
                                       private_key=state["aff_keys"].get(path))
-                    fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
-                                                    state["bl_secrets"].get(path, []),
-                                                    state["bl_keys"].get(path, []))
-                    fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
-                                                state["bl_secrets"].get(path, []))
+                    if not v_kombox.get():
+                        fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
+                                                        state["bl_secrets"].get(path, []),
+                                                        state["bl_keys"].get(path, []))
+                        fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
+                                                    state["bl_secrets"].get(path, []))
                     q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
