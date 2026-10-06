@@ -643,6 +643,9 @@ def run_window(initial_paths):
             show_volumes(path, fh, payload)
         elif kind == "datalight":
             show_datalight_volumes(path, payload)
+        elif kind == "status":
+            status["text"] = payload
+            root.after(50, poll_contents)
         else:
             messagebox.showerror("qnxprobe", f"could not read {path}:\n{payload}")
             done_loading()
