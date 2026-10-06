@@ -120,7 +120,7 @@ def run_window(initial_paths):
     # passwords: an encrypted image's password, by path, once it has opened the
     # image; kept in memory for this window only, never written anywhere
     state = dict(proc=None, fh=None, volumes=[], nodes={}, image_path=None, passwords={},
-                 bl_secrets={}, bl_keys={}, aff_keys={}, kombox_temp=None)
+                 bl_secrets={}, bl_keys={}, aff_keys={}, kombox_temp=None, ftl100_temp=None)
 
     def ask_password(path, wrong):
         """The password for an encrypted image, asked for on the main thread, or None
@@ -598,6 +598,12 @@ def run_window(initial_paths):
             except OSError:
                 pass
             state["kombox_temp"] = None
+        if state.get("ftl100_temp"):
+            try:
+                os.remove(state["ftl100_temp"])
+            except OSError:
+                pass
+            state["ftl100_temp"] = None
         tree.delete(*tree.get_children())
         b_save["state"] = "disabled"
 
