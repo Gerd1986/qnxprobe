@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.59"
+QNXPROBE_VERSION = "1.60"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -6803,6 +6803,166 @@ class EtfsWalker:
             left -= take
 
 
+
+# ---------------------------------------------------------------------------
+# Microware OS-9 RBF (Random Block File)
+#
+# RBF has no fixed magic.  LSN 0 is the volume descriptor; DD.TOT is a
+# big-endian 24-bit sector count, DD.MAP the allocation-map byte count,
+# DD.BIT sectors/cluster, and DD.DIR the root file-descriptor LSN.  Directory
+# entries are 29-byte high-bit-terminated names plus a 24-bit FD LSN.  A file
+# descriptor stores its byte size at +9 and five-byte (LSN,count) segment
+# descriptors from +16.  Detection therefore validates the root FD and the
+# "."/".." directory entries rather than trusting a magic number.
+# ---------------------------------------------------------------------------
+OS9_RBF_SECTOR_SIZES = (128, 256, 512, 1024, 2048, 4096)
+
+
+def _os9_u24(b):
+    return (b[0] << 16) | (b[1] << 8) | b[2]
+
+
+def _os9_name(raw):
+    out = bytearray()
+    for ch in raw:
+        if ch == 0:
+            break
+        out.append(ch & 0x7f)
+        if ch & 0x80:
+            break
+    return bytes(out).decode("latin-1", "replace")
+
+
+def _os9_probe(fh, base, room, sector_size):
+    if room < sector_size:
+        return None
+    dd = read_at(fh, base, sector_size)
+    if len(dd) < sector_size:
+        return None
+    total = _os9_u24(dd[0:3])
+    mapbytes = struct.unpack_from(">H", dd, 4)[0]
+    bit = struct.unpack_from(">H", dd, 6)[0]
+    root = _os9_u24(dd[8:11])
+    if total < 4 or not mapbytes or not bit or root < 1 or root >= total:
+        return None
+    volume_bytes = total * sector_size
+    if volume_bytes > room:
+        return None
+    need = (total + bit * 8 - 1) // (bit * 8)
+    if mapbytes < need:
+        return None
+    fd = read_at(fh, base + root * sector_size, sector_size)
+    if len(fd) < sector_size or not (fd[0] & 0x80):
+        return None
+    dsize = struct.unpack_from(">I", fd, 9)[0]
+    if not dsize or dsize > volume_bytes:
+        return None
+    seg_lsn = _os9_u24(fd[16:19])
+    seg_count = struct.unpack_from(">H", fd, 19)[0]
+    if seg_lsn < 1 or not seg_count or seg_lsn + seg_count > total:
+        return None
+    raw = read_at(fh, base + seg_lsn * sector_size,
+                  min(dsize, seg_count * sector_size, 4096))
+    dot = dotdot = False
+    for off in range(0, len(raw) - 31, 32):
+        name = _os9_name(raw[off:off + 29])
+        child = _os9_u24(raw[off + 29:off + 32])
+        dot |= name == "." and child == root
+        dotdot |= name == ".." and child != 0
+    if not (dot and dotdot):
+        return None
+    return dict(sector_size=sector_size, total=total, size=volume_bytes,
+                map_bytes=mapbytes, cluster_sectors=bit, root=root,
+                name=_os9_name(dd[31:63]))
+
+
+def identify_os9_rbf(fh, base, size):
+    for sector_size in OS9_RBF_SECTOR_SIZES:
+        hit = _os9_probe(fh, base, size, sector_size)
+        if hit:
+            return "os9-rbf", [
+                f"volume       {hit['name'] or '(unnamed)'}",
+                f"sector size  {sector_size:,} bytes",
+                f"sectors      {hit['total']:,}   {human(hit['size'])}",
+                f"alloc map    {hit['map_bytes']:,} bytes, "
+                f"{hit['cluster_sectors']:,} sector(s)/cluster",
+                f"root FD      LSN {hit['root']:,}",
+            ]
+    return None
+
+
+class Os9RbfWalker:
+    """Read classic Microware OS-9 RBF through qnxprobe's shared walker API."""
+
+    def __init__(self, fh, base, size):
+        self.fh, self.base = fh, base
+        self.info = None
+        for sector_size in OS9_RBF_SECTOR_SIZES:
+            hit = _os9_probe(fh, base, size, sector_size)
+            if hit:
+                self.info = hit
+                break
+        if not self.info:
+            raise ValueError("not an OS-9 RBF filesystem")
+        self.sector_size = self.info["sector_size"]
+        self.total = self.info["total"]
+        self.root = self.info["root"]
+
+    def _fd(self, lsn):
+        if not 0 < lsn < self.total:
+            raise ValueError(f"OS-9 RBF invalid FD LSN {lsn}")
+        b = read_at(self.fh, self.base + lsn * self.sector_size, self.sector_size)
+        if len(b) < self.sector_size:
+            raise ValueError(f"OS-9 RBF short FD at LSN {lsn}")
+        attr = b[0]
+        size = struct.unpack_from(">I", b, 9)[0]
+        segs = []
+        for off in range(16, self.sector_size - 4, 5):
+            start = _os9_u24(b[off:off + 3])
+            count = struct.unpack_from(">H", b, off + 3)[0]
+            if not start or not count:
+                break
+            if start + count > self.total:
+                raise ValueError(f"OS-9 RBF segment outside volume in FD {lsn}")
+            segs.append((start, count))
+        # OS-9's five-byte date begins year since 1900, month, day, hour, minute.
+        y, mo, day, hour, minute = b[3:8]
+        try:
+            mtime = int(datetime.datetime(1900 + y, mo, day, hour, minute,
+                                          tzinfo=datetime.timezone.utc).timestamp())
+        except ValueError:
+            mtime = 0
+        return attr, size, segs, mtime
+
+    def _content(self, lsn):
+        attr, size, segs, mtime = self._fd(lsn)
+        out = bytearray()
+        for start, count in segs:
+            out += read_at(self.fh, self.base + start * self.sector_size,
+                           count * self.sector_size)
+        return attr, size, bytes(out[:size]), mtime
+
+    def listdir(self, node):
+        attr, size, raw, _mtime = self._content(node)
+        if not (attr & 0x80):
+            return []
+        out = []
+        for off in range(0, len(raw) - 31, 32):
+            name = _os9_name(raw[off:off + 29])
+            child = _os9_u24(raw[off + 29:off + 32])
+            if name and name not in (".", "..") and child:
+                out.append((name, child))
+        return out
+
+    def entry(self, node):
+        attr, size, _segs, mtime = self._fd(node)
+        mode = S_IFDIR | 0o755 if attr & 0x80 else S_IFREG | 0o644
+        return mode, (0 if attr & 0x80 else size), mtime
+
+    def read_file(self, node, size):
+        _attr, _stored, raw, _mtime = self._content(node)
+        yield raw[:size] if size else raw
+
 # ---------------------------------------------------------------------------
 # EFS is QNX's other flash filesystem, the F3S "flash 3" format. It is not
 # transaction based: the flash is divided into erase units, each unit carries a
@@ -10733,6 +10893,8 @@ def walker_for(kind, fh, base, size=None):
         return ApfsWalker(fh, base)
     if kind == "efs":
         return EfsWalker(fh, base)
+    if kind == "os9-rbf" and size is not None:
+        return Os9RbfWalker(fh, base, size)
     if kind == "qnx4":
         return Qnx4Walker(fh, base)
     if kind == "etfs" and size is not None:
@@ -11997,6 +12159,10 @@ def identify_fs(fh, base, size=None):
     if f2fs:
         return f2fs
 
+    os9 = identify_os9_rbf(fh, base, size)
+    if os9:
+        return os9
+
     efs = identify_efs(fh, base, size)
     if efs:
         return efs
@@ -12375,6 +12541,15 @@ def flash_regions(fh, size):
                             hits.add((base, b"efs"))
                         break
             j = chunk.find(EFS_SIG, j + 1)
+        # RBF has no magic. Probe 256-byte boundaries; the detector then
+        # validates DD.TOT/DD.MAP/DD.BIT/DD.DIR, the root FD and "."/"..".
+        for k in range(0, min(step, len(chunk) - 32), 256):
+            cand = pos + k
+            for rsec in OS9_RBF_SECTOR_SIZES:
+                rh = _os9_probe(fh, cand, size - cand, rsec)
+                if rh:
+                    hits.add((cand, b"os9-rbf"))
+                    break
         m = EXT_SB_OFF + EXT_F["magic"]                # pos is a multiple of FLASH_ALIGN
         for k in range(0, min(step, len(chunk) - m - 1), FLASH_ALIGN):
             if chunk[k + m:k + m + 2] == b"\x53\xef":
@@ -12408,6 +12583,12 @@ def flash_regions(fh, size):
                 else:
                     break
             found.append(["ubi", off, end - off])
+        elif magic == b"os9-rbf":
+            hit = next((_os9_probe(fh, off, size - off, s) for s in OS9_RBF_SECTOR_SIZES
+                        if _os9_probe(fh, off, size - off, s)), None)
+            if not hit:
+                continue
+            found.append(["os9-rbf", off, hit["size"]])
         elif magic == b"efs":
             us = _efs_unit_size(fh, off)
             boot = _efs_boot(fh, off, min(size - off, 1 << 24)) if us else None
