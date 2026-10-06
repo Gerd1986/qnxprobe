@@ -435,6 +435,7 @@ def run_window(initial_paths):
             # incompatible discovery pass over the physical NAND.
             args += ["--datalight", "--datalight-output", outdir]
             state["child_env"] = dict(os.environ)
+            state["child_env"]["PYTHONUNBUFFERED"] = "1"
             return args + paths
         try:
             args += ["--scan-limit", str(int(v_scan.get()))]
@@ -466,6 +467,7 @@ def run_window(initial_paths):
             if not unlock(path) or not unlock_volumes(path):
                 return None
         env = dict(os.environ)
+        env["PYTHONUNBUFFERED"] = "1"
         given = [state["passwords"][p] for p in paths if p in state["passwords"]]
         given += [x for p in paths for x in state["bl_secrets"].get(p, [])]
         for n, secret in enumerate(given):
@@ -599,7 +601,17 @@ def run_window(initial_paths):
                                                 state["bl_keys"].get(path, []))
                 fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
                                             state["bl_secrets"].get(path, []))
-                q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
+                if v_datalight.get():
+                    # Raw FlashFX/Reliance NAND is not a normal qnxprobe volume.
+                    # Build only the Reliance metadata index here; payloads are
+                    # read lazily when the examiner saves a selected file.
+                    import datalight_reliance as dl
+                    vols = dl.gui_volumes(path)
+                    fh.close()
+                    fh = None
+                    q_con.put(("datalight", path, fh, vols))
+                else:
+                    q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
         threading.Thread(target=work, daemon=True).start()
@@ -613,6 +625,8 @@ def run_window(initial_paths):
             return
         if kind == "ok":
             show_volumes(path, fh, payload)
+        elif kind == "datalight":
+            show_datalight_volumes(path, payload)
         else:
             messagebox.showerror("qnxprobe", f"could not read {path}:\n{payload}")
             done_loading()
@@ -620,6 +634,19 @@ def run_window(initial_paths):
     def done_loading():
         b_load["state"] = "normal"
         status["text"] = "ready"
+
+    def show_datalight_volumes(path, vols):
+        state.update(fh=None, volumes=vols, image_path=path)
+        for i, v in enumerate(vols):
+            label = f"{v['label']}   reliance-nitro"
+            iid = tree.insert("", "end", text=label,
+                              values=("volume", q.human(v["size"]), v.get("detail", ""), "", "", ""),
+                              open=False)
+            state["nodes"][iid] = (i, v["root"], True, None)
+            tree.insert(iid, "end", text="loading...", values=("", "", "", "", "", ""))
+        done_loading()
+        if not vols:
+            status["text"] = "no Datalight FlashFX / Reliance volume found"
 
     def show_volumes(path, fh, vols):
         state.update(fh=fh, volumes=vols, image_path=path)
@@ -650,7 +677,7 @@ def run_window(initial_paths):
             return
         tree.delete(*kids)
         vi, ino, _isdir, _ = node
-        w = state["volumes"][vi]["walker"]
+        w = state["volumes"][vi].get("walker") or state["volumes"][vi].get("datalight_walker")
         try:
             readings = hasattr(w, "listdir_records")
             entries = list(w.listdir_records(ino)) if readings \
