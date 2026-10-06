@@ -973,6 +973,109 @@ def write_csv(path: Path, rows):
         w.writerows(rows)
 
 
+
+# ---------------------------------------------------------------------------
+# qnxprobe GUI adapter -- metadata index only, payloads are read lazily
+# ---------------------------------------------------------------------------
+
+class RelianceGuiWalker:
+    def __init__(self, raw_file, raw_mm, vol, records, allocation):
+        self._raw_file = raw_file
+        self._mm = raw_mm
+        self.vol = vol
+        self.allocation = allocation
+        self.root, self.by_oid, self.children, self.directory_ids = build_namespace(records)
+        self._alloc = allocation["by_object"]
+
+    def close(self):
+        try:
+            self._mm.close()
+        finally:
+            self._raw_file.close()
+
+    def listdir(self, node):
+        return [(r["name"], r["object_id"]) for r in self.children.get(node, [])]
+
+    def entry(self, node):
+        if node == self.root:
+            return (0o040755, 0, None)
+        r = self.by_oid.get(node)
+        if r is None:
+            return None
+        if node in self.directory_ids:
+            return (0o040755, 0, None)
+        ars = self._alloc.get(node, [])
+        size = object_size_from_lalc(ars)
+        ts = object_timestamps_from_lalc(ars)
+        mtime = ts.get("mtime_ms")
+        if mtime is not None:
+            mtime = mtime / 1000.0
+        return (0o100644, int(size or 0), mtime)
+
+    def stamps(self, node):
+        ars = self._alloc.get(node, [])
+        ts = object_timestamps_from_lalc(ars)
+        def sec(v):
+            return (v / 1000.0) if v is not None else 0
+        return sec(ts.get("ctime_ms")), sec(ts.get("mtime_ms")), sec(ts.get("atime_ms"))
+
+    def read_file(self, node, size):
+        ars = self._alloc.get(node, [])
+        extents = object_extents_from_lalc(self.vol, ars)
+        remaining = int(size or 0)
+        for ex in extents:
+            if remaining <= 0:
+                break
+            # Extents returned by the recovery engine are logical Reliance
+            # byte ranges. Read only when the GUI actually requests the file.
+            off = ex.get("offset", ex.get("byte_offset", ex.get("start", 0)))
+            length = ex.get("length", ex.get("byte_length", ex.get("size", 0)))
+            if not length:
+                continue
+            data = self.vol.dev.read(self.vol.start + int(off), min(int(length), remaining))
+            if data:
+                yield data
+                remaining -= len(data)
+
+
+def gui_volumes(path):
+    """Return Reliance volumes as qnxprobe-GUI-compatible lazy walkers.
+
+    Unlike main(), this does not materialize the namespace or file payloads.
+    """
+    raw_file = open(path, "rb")
+    mm = mmap.mmap(raw_file.fileno(), 0, access=mmap.ACCESS_READ)
+    try:
+        _tp, _tu, headers, _invalid = scan_flashfx_units(mm)
+        groups = choose_flashfx_groups(headers)
+        out = []
+        for gi, units in enumerate(groups, 1):
+            mapping, _statuses = build_flashfx_map(mm, units)
+            dev = FlashFXLogical(mm, mapping)
+            for vi, info in enumerate(find_reliance_volumes(dev), 1):
+                vol = RelianceVolume(dev, info)
+                result = recover_directory_records(vol)
+                allocation = recover_allocation_records(vol)
+                walker = RelianceGuiWalker(raw_file, mm, vol, result["records"], allocation)
+                out.append({
+                    "label": f"FlashFX {gi} / Reliance {vi}",
+                    "kind": "reliance-nitro",
+                    "name": "",
+                    "size": info["size"],
+                    "detail": f"start 0x{info['start']:X}",
+                    "root": walker.root,
+                    "datalight_walker": walker,
+                })
+        if not out:
+            mm.close()
+            raw_file.close()
+        return out
+    except Exception:
+        mm.close()
+        raw_file.close()
+        raise
+
+
 # ---------------------------------------------------------------------------
 # End-to-end
 # ---------------------------------------------------------------------------
