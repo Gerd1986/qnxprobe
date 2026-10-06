@@ -25,31 +25,6 @@ T=8
 PRIM=0x201B
 N=(1<<M)-1
 
-# Degree-104 BCH generator for m=13/t=8. The stored 13 parity bytes are
-# the systematic polynomial remainder, MSB first. A 256-entry byte table
-# makes the overwhelmingly common "ECC already matches" path cheap.
-GEN=0x115f914e07b0c138741c5c4fb23
-GEN_DEG=104
-GEN_MASK=(1<<GEN_DEG)-1
-_PARITY_TABLE=[]
-for _b in range(256):
-    _r=_b << (GEN_DEG-8)
-    for _ in range(8):
-        _r = ((_r << 1) ^ GEN) if (_r & (1 << (GEN_DEG-1))) else (_r << 1)
-        _r &= GEN_MASK
-    _PARITY_TABLE.append(_r)
-
-def _parity(payload):
-    """Return the 13 stored BCH parity bytes for a 516-byte payload."""
-    r=0
-    for b in payload:
-        top=(r >> (GEN_DEG-8)) & 0xff
-        r=((r << 8) & GEN_MASK) ^ _PARITY_TABLE[top ^ b]
-    for _ in range(ECC_BYTES):
-        top=(r >> (GEN_DEG-8)) & 0xff
-        r=((r << 8) & GEN_MASK) ^ _PARITY_TABLE[top]
-    return r.to_bytes(ECC_BYTES,"big")
-
 # GF(2^13) tables
 _EXP=[0]*(2*N)
 _LOG=[-1]*(1<<M)
@@ -63,19 +38,39 @@ for i in range(N,2*N): _EXP[i]=_EXP[i-N]
 def _mul(a,b):
     return 0 if not a or not b else _EXP[(_LOG[a]+_LOG[b])%N]
 
-def _syndromes(code):
-    """S1..S16 for an MSB-first shortened BCH codeword."""
-    syn=[]
-    bits=len(code)*8
-    for j in range(1,2*T+1):
+# Bytewise syndrome tables. For binary BCH, even syndromes are squares of
+# earlier syndromes, so only S1,S3,...,S15 need to scan the codeword.
+_ODD=tuple(range(1,2*T,2))
+_FAST_MUL={}
+_FAST_BYTE={}
+for _j in _ODD:
+    _a=_EXP[_j%N]
+    _a8=1
+    for _ in range(8): _a8=_mul(_a8,_a)
+    _FAST_MUL[_j]=[_mul(v,_a8) for v in range(1<<M)]
+    bt=[]
+    for b in range(256):
         s=0
-        # Horner evaluation at alpha**j; first bit is highest coefficient.
-        a=_EXP[j%N]
-        for byte in code:
-            for k in range(7,-1,-1):
-                s=_mul(s,a) ^ ((byte>>k)&1)
-        syn.append(s)
-    return syn
+        for k in range(7,-1,-1):
+            s=_mul(s,_a) ^ ((b>>k)&1)
+        bt.append(s)
+    _FAST_BYTE[_j]=bt
+
+def _sq(a):
+    return _mul(a,a)
+
+def _syndromes(code):
+    """S1..S16, bytewise; mathematically identical to the old bitwise loop."""
+    vals={}
+    for j in _ODD:
+        s=0; mt=_FAST_MUL[j]; bt=_FAST_BYTE[j]
+        for b in code:
+            s=mt[s] ^ bt[b]
+        vals[j]=s
+    vals[2]=_sq(vals[1]); vals[4]=_sq(vals[2]); vals[6]=_sq(vals[3])
+    vals[8]=_sq(vals[4]); vals[10]=_sq(vals[5]); vals[12]=_sq(vals[6])
+    vals[14]=_sq(vals[7]); vals[16]=_sq(vals[8])
+    return [vals[j] for j in range(1,2*T+1)]
 
 def _berlekamp_massey(s):
     C=[0]*(2*T+1); B=[0]*(2*T+1)
@@ -130,9 +125,6 @@ def process_page(page):
         pad=page[b+530:b+532]
         # Erased/unprogrammed codewords need no BCH work.
         if payload==b"\xff"*DATA_BYTES and ecc==b"\xff"*ECC_BYTES:
-            fixed=payload; clean+=1
-        elif _parity(payload)==ecc:
-            # Fast path: clean codeword; skip syndrome/BM/Chien completely.
             fixed=payload; clean+=1
         else:
             fixed,n,status=_correct_codeword(payload,ecc)
