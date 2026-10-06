@@ -288,6 +288,7 @@ def run_window(initial_paths):
     v_exclude = tk.StringVar(value="")
     v_zip = tk.StringVar(value="")
     v_datalight = tk.BooleanVar(value=False)
+    v_kombox = tk.BooleanVar(value=False)
     v_datalight_out = tk.StringVar(value="datalight_recovered")
 
     ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
