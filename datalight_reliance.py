@@ -1026,16 +1026,18 @@ class RelianceGuiWalker:
         for ex in extents:
             if remaining <= 0:
                 break
-            # Extents returned by the recovery engine are logical Reliance
-            # byte ranges. Read only when the GUI actually requests the file.
-            off = ex.get("offset", ex.get("byte_offset", ex.get("start", 0)))
-            length = ex.get("length", ex.get("byte_length", ex.get("size", 0)))
-            if not length:
-                continue
-            data = self.vol.dev.read(self.vol.start + int(off), min(int(length), remaining))
-            if data:
-                yield data
-                remaining -= len(data)
+            start = int(ex["start_block"])
+            count = int(ex["block_count"])
+            for bn in range(start, start + count):
+                if remaining <= 0:
+                    break
+                data = self.vol.block(bn)
+                if not data:
+                    break
+                chunk = data[:remaining]
+                if chunk:
+                    yield chunk
+                    remaining -= len(chunk)
 
 
 def gui_volumes(path):
