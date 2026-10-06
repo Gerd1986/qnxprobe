@@ -565,6 +565,13 @@ def run_window(initial_paths):
 
     # ---- contents pane ----------------------------------------------------
     def close_image():
+        for v in state.get("volumes", []):
+            w = v.get("datalight_walker") if isinstance(v, dict) else None
+            if w is not None and hasattr(w, "close"):
+                try:
+                    w.close()
+                except (OSError, ValueError):
+                    pass
         if state["fh"] is not None:
             try:
                 state["fh"].close()
@@ -586,7 +593,9 @@ def run_window(initial_paths):
         if not unlock(path):                 # an encrypted image, its password refused
             done_loading()
             return
-        if not unlock_volumes(path):         # a BitLocker or APFS volume's key asked for
+        # A raw Datalight NAND must not go through the normal BitLocker/APFS
+        # volume discovery first; that is both irrelevant and very expensive.
+        if not v_datalight.get() and not unlock_volumes(path):
             done_loading()
             return
 
@@ -594,23 +603,20 @@ def run_window(initial_paths):
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
             try:
-                fh = q.open_image(path, password=state["passwords"].get(path),
-                                  private_key=state["aff_keys"].get(path))
-                fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
-                                                state["bl_secrets"].get(path, []),
-                                                state["bl_keys"].get(path, []))
-                fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
-                                            state["bl_secrets"].get(path, []))
                 if v_datalight.get():
-                    # Raw FlashFX/Reliance NAND is not a normal qnxprobe volume.
-                    # Build only the Reliance metadata index here; payloads are
-                    # read lazily when the examiner saves a selected file.
+                    # Dedicated raw-NAND path: do not open/scan it through the
+                    # normal qnxprobe volume stack first.
                     import datalight_reliance as dl
                     vols = dl.gui_volumes(path)
-                    fh.close()
-                    fh = None
-                    q_con.put(("datalight", path, fh, vols))
+                    q_con.put(("datalight", path, None, vols))
                 else:
+                    fh = q.open_image(path, password=state["passwords"].get(path),
+                                      private_key=state["aff_keys"].get(path))
+                    fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
+                                                    state["bl_secrets"].get(path, []),
+                                                    state["bl_keys"].get(path, []))
+                    fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
+                                                state["bl_secrets"].get(path, []))
                     q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
                 q_con.put(("err", path, None, str(exc)))
