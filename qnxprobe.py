@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.60"
+QNXPROBE_VERSION = "1.61"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -9791,7 +9791,21 @@ def _yaffs_layout_in(fh, base, size, pages_for, windows):
                 if good >= 0.9 * len(used) and not claimed:
                     hint = True
                 continue
-            rank = (version == 1 or eccs >= 0.9 * good, parsed[hdr_e], good / len(used))
+            # Tag ECC is useful evidence when present, but it is optional in
+            # valid YAFFS2 images.  mkyaffs2image variants (and images accepted
+            # by Autopsy/TSK) may leave the 12 ECC bytes erased while the packed
+            # tags and object headers are otherwise fully consistent.  Do not
+            # make ECC a requirement: rank layouts with verified ECC first, then
+            # those whose ECC is absent, while the 90% tag/header checks above
+            # remain the false-positive guard.
+            ecc_present = sum(
+                1 for _d, s in used
+                if (lambda raw: len(raw) == 12 and raw != b"\xff" * 12)
+                   (s[off + 16:off + 28])
+            ) if version == 2 else 0
+            ecc_rank = 2 if version == 1 or (ecc_present and eccs >= 0.9 * good) else (
+                1 if version == 2 and not ecc_present else 0)
+            rank = (ecc_rank, parsed[hdr_e], good / len(used))
             if best is None or rank > best[0]:
                 best = (rank, (version, chunk, spare, off, e, hdr_e))
     return (best[1] if best else None), hint
