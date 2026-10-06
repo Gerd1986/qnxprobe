@@ -997,7 +997,8 @@ def main():
             "Also write each detected Reliance Nitro volume as a standalone "
             "logical .bin image"
         )
-    )    ap.add_argument(
+    )
+    ap.add_argument(
         "--placeholders", action="store_true",
         help="Create zero-byte placeholders only where payload recovery is unavailable"
     )
@@ -1015,7 +1016,9 @@ def main():
     with dump.open("rb") as f:
         mm = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
 
+        print("[1/6] Scanning FlashFX erase-unit headers ...", flush=True)
         total_pages, total_units, headers, invalid = scan_flashfx_units(mm)
+        print(f"[1/6] done: {len(headers):,} valid headers", flush=True)
         groups = choose_flashfx_groups(headers)
 
         print(f"Raw size             : {len(mm):,}")
@@ -1028,7 +1031,9 @@ def main():
 
         for gi, units in enumerate(groups, 1):
             h = units[0]
+            print(f"[2/6] Building FlashFX map for group {gi}/{len(groups)} ...", flush=True)
             mapping, statuses = build_flashfx_map(mm, units)
+            print(f"[2/6] done: {sum(x is not None for x in mapping):,} mapped pages", flush=True)
             dev = FlashFXLogical(mm, mapping)
             mapped = sum(x is not None for x in mapping)
 
@@ -1049,7 +1054,9 @@ def main():
                 print("Writing FlashFX image :", img)
                 dev.write_image(img)
 
+            print("[3/6] Searching reconstructed FlashFX pages for Reliance MAST ...", flush=True)
             volumes = find_reliance_volumes(dev)
+            print(f"[3/6] done: {len(volumes)} Reliance volume(s)", flush=True)
             print(f"Reliance volumes     : {len(volumes)}")
 
             if not volumes:
@@ -1066,9 +1073,14 @@ def main():
                     print(f"  Writing Reliance volume {vi}: {rimg}")
                     vol.write_image(rimg)
 
+                print(f"[4/6] Reading Reliance directory metadata (volume {vi}) ...", flush=True)
                 result = recover_directory_records(vol)
+                print(f"[4/6] done: {len(result['records']):,} directory records", flush=True)
+                print(f"[5/6] Reading Reliance allocation metadata (volume {vi}) ...", flush=True)
                 allocation = recover_allocation_records(vol)
+                print(f"[5/6] done: {len(allocation['by_object']):,} allocated objects", flush=True)
 
+                print(f"[6/6] Recovering directory tree and file payloads (volume {vi}) ...", flush=True)
                 root_id, manifest = materialize_namespace(
                     vdir,
                     result["records"],
@@ -1076,6 +1088,7 @@ def main():
                     allocation=allocation,
                     placeholders=args.placeholders
                 )
+                print(f"[6/6] done: {len(manifest):,} namespace entries", flush=True)
 
                 csv_path = vdir / "directory_and_file_manifest.csv"
                 tree_path = vdir / "tree.txt"
