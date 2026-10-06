@@ -945,7 +945,7 @@ def parse_mbr(fh):
     # BitLocker's "-FVE-FS-") or 82..90 (FAT32) says it is a volume, not a
     # partition table.
     if (mbr[3:11] in (b"EXFAT   ", b"NTFS    ", BDE_SIGNATURE)
-            or mbr[82:90] == b"FAT32   " or mbr[54:62] == b"FAT16   "):
+            or mbr[82:90] == b"FAT32   " or mbr[54:62] in (b"FAT12   ", b"FAT16   ")):
         return None
     # A QNX4 boot block can also end in 0x55AA (the dinit boot sector does).
     # The QNX4 superblock is the NEXT sector: its first entry is the root
@@ -2189,7 +2189,7 @@ class F2fsWalker:
 
 
 # ---------------------------------------------------------------------------
-# FAT32 and exFAT.
+# FAT12, FAT32 and exFAT.
 #
 # FAT is the file system of removable media and of many embedded devices, so a
 # vehicle image can carry one beside its QNX and ext volumes. Both are read
@@ -2529,6 +2529,84 @@ class Fat32Walker:
     def read_file(self, node, size):
         clus, sz, _ = node
         yield self._read_chain(clus, sz)
+
+
+class Fat12Walker(Fat32Walker):
+    """List and read files from a FAT12 volume.
+
+    FAT12 uses the same 32-byte directory entries and VFAT long names as FAT32,
+    but its allocation table packs two 12-bit entries into three bytes and its
+    root directory is a fixed region between the FATs and the data area rather
+    than a cluster chain.  A root node with cluster 0 is used internally to
+    represent that fixed directory; subdirectories use ordinary cluster chains.
+    """
+
+    def __init__(self, fh, base):
+        self.fh = fh
+        self.base = base
+        bpb = read_at(fh, base, 512)
+        self.bps = struct.unpack_from("<H", bpb, 11)[0]
+        self.spc = bpb[13]
+        self.reserved = struct.unpack_from("<H", bpb, 14)[0]
+        self.nfats = bpb[16]
+        self.root_entries = struct.unpack_from("<H", bpb, 17)[0]
+        self.total_sectors = (struct.unpack_from("<H", bpb, 19)[0]
+                              or struct.unpack_from("<I", bpb, 32)[0])
+        self.spf = struct.unpack_from("<H", bpb, 22)[0]
+        self.fat_start = base + self.reserved * self.bps
+        self.root_dir_sectors = ((self.root_entries * 32 + self.bps - 1)
+                                 // self.bps)
+        self.root_start = self.fat_start + self.nfats * self.spf * self.bps
+        self.data_start = self.root_start + self.root_dir_sectors * self.bps
+        self.cluster_bytes = self.spc * self.bps
+        self.root = (0, self.root_entries * 32, True)
+
+    def _fat_next(self, clus):
+        # FAT12 entry n starts at floor(3*n/2).  Even n uses the low 12 bits;
+        # odd n uses the high 12 bits of the same little-endian 16-bit word.
+        off = self.fat_start + clus + (clus // 2)
+        raw = read_at(self.fh, off, 2)
+        if len(raw) < 2:
+            return 0x0FFF
+        word = struct.unpack_from("<H", raw, 0)[0]
+        return ((word >> 4) if (clus & 1) else (word & 0x0FFF))
+
+    def _chain(self, clus):
+        seen = set()
+        while 0x2 <= clus < 0x0FF8 and clus not in seen:
+            seen.add(clus)
+            yield clus
+            clus = self._fat_next(clus)
+
+    def _read_chain(self, clus, size=None):
+        if clus == 0:
+            raw = read_at(self.fh, self.root_start, self.root_dir_sectors * self.bps)
+            return raw[:size] if size is not None else raw
+        return super()._read_chain(clus, size)
+
+    def free_extents(self, min_bytes=0):
+        if not self.cluster_bytes or not self.total_sectors or not self.spc:
+            return []
+        first_data_sector = (self.reserved + self.nfats * self.spf
+                             + self.root_dir_sectors)
+        data_sectors = self.total_sectors - first_data_sector
+        count = max(0, data_sectors // self.spc)
+        runs, run_start = [], None
+        for clus in range(2, count + 2):
+            free = self._fat_next(clus) == 0
+            if free and run_start is None:
+                run_start = clus
+            elif not free and run_start is not None:
+                runs.append((run_start, clus - run_start))
+                run_start = None
+        if run_start is not None:
+            runs.append((run_start, count + 2 - run_start))
+        out = []
+        for first, n in runs:
+            length = n * self.cluster_bytes
+            if length >= min_bytes:
+                out.append((self._cluster_off(first), length))
+        return out
 
 
 def _dos_stamp(date, time_, tenths=0):
@@ -10893,6 +10971,8 @@ def walker_for(kind, fh, base, size=None):
     """
     if kind and kind.startswith("ext"):
         return ExtWalker(fh, base)
+    if kind == "fat12":
+        return Fat12Walker(fh, base)
     if kind == "fat32":
         return Fat32Walker(fh, base)
     if kind == "exfat":
@@ -11135,7 +11215,7 @@ def identify_ntfs(fh, base):
 
 
 def identify_fat(fh, base):
-    """Return (kind, lines) for a FAT32 or exFAT volume at base, else None.
+    """Return (kind, lines) for a FAT12, FAT32 or exFAT volume at base, else None.
 
     exFAT names itself in bytes 3..11 of the boot sector. FAT32 is recognised
     by its "FAT32   " filesystem-type string at offset 82 together with a 0x55AA
@@ -11158,16 +11238,40 @@ def identify_fat(fh, base):
             f"clusters     {clusters:,}",
             f"volume       {human(vol)}",
         ]
-    if b[82:90] == b"FAT32   ":
-        bps = struct.unpack_from("<H", b, 11)[0]
-        spc = b[13]
-        total = struct.unpack_from("<I", b, 32)[0] * bps
-        label = b[71:82].decode("ascii", "replace").rstrip(" ")
-        return "fat32", [
-            f"label        {label or '(none)'}",
-            f"bytes/sector {bps}   sectors/cluster {spc}",
-            f"volume       {human(total)}",
-        ]
+    # FAT12/16/32 are distinguished by the number of data clusters, not by
+    # the human-readable filesystem-type field.  Validate the common BPB first;
+    # this also recognises formatters that left that advisory string blank.
+    bps = struct.unpack_from("<H", b, 11)[0]
+    spc = b[13]
+    reserved = struct.unpack_from("<H", b, 14)[0]
+    nfats = b[16]
+    root_entries = struct.unpack_from("<H", b, 17)[0]
+    total_sectors = (struct.unpack_from("<H", b, 19)[0]
+                     or struct.unpack_from("<I", b, 32)[0])
+    spf16 = struct.unpack_from("<H", b, 22)[0]
+    if (bps in (512, 1024, 2048, 4096)
+            and spc in (1, 2, 4, 8, 16, 32, 64, 128)
+            and reserved and nfats in (1, 2) and total_sectors):
+        root_secs = (root_entries * 32 + bps - 1) // bps
+        spf = spf16 or struct.unpack_from("<I", b, 36)[0]
+        first_data = reserved + nfats * spf + root_secs
+        if spf and total_sectors > first_data:
+            clusters = (total_sectors - first_data) // spc
+            if clusters < 4085 and root_entries:
+                label = b[43:54].decode("ascii", "replace").rstrip(" ")
+                return "fat12", [
+                    f"label        {label or '(none)'}",
+                    f"bytes/sector {bps}   sectors/cluster {spc}",
+                    f"clusters     {clusters:,}",
+                    f"volume       {human(total_sectors * bps)}",
+                ]
+            if clusters >= 65525 and b[82:90] == b"FAT32   ":
+                label = b[71:82].decode("ascii", "replace").rstrip(" ")
+                return "fat32", [
+                    f"label        {label or '(none)'}",
+                    f"bytes/sector {bps}   sectors/cluster {spc}",
+                    f"volume       {human(total_sectors * bps)}",
+                ]
     return None
 
 
@@ -12748,7 +12852,7 @@ def volumes(fh, size=None):
         lba         base in the disk's logical sectors (4096 bytes on a disk
                     whose GPT header is at byte 4096, else 512), the identity
                     an extraction is named by
-        kind        "qnx6", "ext4", "fat32", "ntfs", ..., "extended container",
+        kind        "qnx6", "ext4", "fat12", "fat32", "ntfs", ..., "extended container",
                     or "not recognised"
         name        the directory the volume extracts under (volume_name)
         detail      a short description from the identifier
@@ -13494,7 +13598,7 @@ def main(path, scan_limit_mib=256, do_list=False, list_depth=2, list_max=400,
                     except Exception as exc:
                         print(f"        could not extract: {exc}")
 
-                if kind in ("fat32", "exfat", "ntfs", "f2fs", "hfs+", "hfsx", "apfs",
+                if kind in ("fat12", "fat32", "exfat", "ntfs", "f2fs", "hfs+", "hfsx", "apfs",
                             "etfs", "efs", "qnx4", "squashfs", "jffs2", "ubi",
                             "ubifs", "yaffs1", "yaffs2") + CFG_KINDS and wanted:
                     if do_list:
