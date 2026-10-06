@@ -20261,6 +20261,8 @@ if __name__ == "__main__":
     ap.add_argument("--self-test", action="store_true",
                     help="build throwaway positive and negative images, confirm "
                          "the detector reports both ways, then delete them")
+    ap.add_argument("--ftl100", action="store_true",
+                    help="reconstruct an M-Systems FTL100 NOR dump to its logical block image, then run normal filesystem discovery")
     ap.add_argument("--qualcomm-kombox", action="store_true",
                     help="preprocess a 4352-byte/page Qualcomm Kommbox NAND: BCH m=13 t=8 ECC correction, remove stuff/ECC/spare bytes, then run normal filesystem discovery on 4096-byte pages")
     ap.add_argument("--datalight", action="store_true",
@@ -20367,6 +20369,27 @@ if __name__ == "__main__":
     # Qualcomm Kommbox raw NAND: correct BCH and strip the interleaved
     # stuff/ECC/spare bytes before the normal UBI/UBIFS/SquashFS discovery.
     # Originals remain read-only; temporary logical images are removed at exit.
+    if args.ftl100:
+        if args.datalight or args.qualcomm_kombox:
+            ap.error("--ftl100, --qualcomm-kombox and --datalight are separate flash layouts; select only one")
+        import atexit
+        import ftl100
+        converted = []
+        temps = []
+        for p in args.image:
+            out, stats = ftl100.preprocess(p)
+            converted.append(out); temps.append(out)
+            print(f"FTL100 preprocessing: {stats['headers']:,} header(s), "
+                  f"{stats['data_units']:,} data unit(s), {stats['transfer_units']:,} transfer unit(s), "
+                  f"{stats['recovered_sectors']:,} recovered sector(s), "
+                  f"{human(stats['logical_bytes'])} logical image")
+        args.image = converted
+        def _cleanup_ftl100():
+            for p in temps:
+                try: os.remove(p)
+                except OSError: pass
+        atexit.register(_cleanup_ftl100)
+
     if args.qualcomm_kombox:
         if args.datalight:
             ap.error("--qualcomm-kombox and --datalight are separate raw-NAND layouts")
