@@ -289,6 +289,7 @@ def run_window(initial_paths):
     v_zip = tk.StringVar(value="")
     v_datalight = tk.BooleanVar(value=False)
     v_kombox = tk.BooleanVar(value=False)
+    v_ftl100 = tk.BooleanVar(value=False)
     v_datalight_out = tk.StringVar(value="datalight_recovered")
 
     ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
@@ -309,12 +310,14 @@ def run_window(initial_paths):
         row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
     ttk.Checkbutton(opts, text="Qualcomm-Kombox (ECC + Stuff entfernen)", variable=v_kombox).grid(
         row=2, column=6, columnspan=2, sticky="w", pady=(6, 0), padx=(12, 0))
+    ttk.Checkbutton(opts, text="M-Systems FTL100", variable=v_ftl100).grid(
+        row=3, column=0, columnspan=2, sticky="w", pady=(6, 0))
     ttk.Label(opts, text="Datalight output").grid(row=2, column=2, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_datalight_out, width=32).grid(
         row=2, column=3, columnspan=3, sticky="ew", pady=(6, 0))
 
-    ttk.Label(opts, text="--extract OUT.zip").grid(row=3, column=0, sticky="e", pady=(6, 0))
-    ttk.Entry(opts, textvariable=v_zip).grid(row=3, column=1, columnspan=6, sticky="ew", pady=(6, 0))
+    ttk.Label(opts, text="--extract OUT.zip").grid(row=4, column=0, sticky="e", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_zip).grid(row=4, column=1, columnspan=6, sticky="ew", pady=(6, 0))
 
     def pick_zip():
         p = filedialog.asksaveasfilename(title="Extraction zip", defaultextension=".zip",
@@ -322,7 +325,7 @@ def run_window(initial_paths):
         if p:
             v_zip.set(p)
 
-    ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=3, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
+    ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=4, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
     for c in (1, 5, 6):
         opts.columnconfigure(c, weight=1)
 
@@ -425,9 +428,12 @@ def run_window(initial_paths):
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
         args = probe_command() + ["--progress"]
-        if v_kombox.get() and v_datalight.get():
-            messagebox.showinfo("qnxprobe", "Qualcomm-Kombox and Datalight are separate NAND layouts; select only one.")
+        selected_flash = sum(bool(v.get()) for v in (v_kombox, v_datalight, v_ftl100))
+        if selected_flash > 1:
+            messagebox.showinfo("qnxprobe", "FTL100, Qualcomm-Kombox and Datalight are separate flash layouts; select only one.")
             return None
+        if v_ftl100.get():
+            args.append("--ftl100")
         if v_kombox.get():
             args.append("--qualcomm-kombox")
         if v_datalight.get():
@@ -609,7 +615,7 @@ def run_window(initial_paths):
             return
         # A raw Datalight NAND must not go through the normal BitLocker/APFS
         # volume discovery first; that is both irrelevant and very expensive.
-        if not v_datalight.get() and not v_kombox.get() and not unlock_volumes(path):
+        if not v_datalight.get() and not v_kombox.get() and not v_ftl100.get() and not unlock_volumes(path):
             done_loading()
             return
 
@@ -625,6 +631,12 @@ def run_window(initial_paths):
                     q_con.put(("datalight", path, None, vols))
                 else:
                     open_path = path
+                    if v_ftl100.get():
+                        import ftl100
+                        open_path, stats = ftl100.preprocess(path)
+                        state["ftl100_temp"] = open_path
+                        q_con.put(("status", path, None,
+                                   f"FTL100: {stats['recovered_sectors']:,} sectors, {stats['data_units']:,} data units"))
                     if v_kombox.get():
                         import qualcomm_kombox
                         def kp(done, total, corr, bad):
@@ -635,7 +647,7 @@ def run_window(initial_paths):
                         state["kombox_temp"] = open_path
                     fh = q.open_image(open_path, password=state["passwords"].get(path),
                                       private_key=state["aff_keys"].get(path))
-                    if not v_kombox.get():
+                    if not v_kombox.get() and not v_ftl100.get():
                         fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
                                                         state["bl_secrets"].get(path, []),
                                                         state["bl_keys"].get(path, []))
