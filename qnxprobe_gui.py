@@ -287,6 +287,8 @@ def run_window(initial_paths):
     v_only = tk.StringVar(value="")
     v_exclude = tk.StringVar(value="")
     v_zip = tk.StringVar(value="")
+    v_datalight = tk.BooleanVar(value=False)
+    v_datalight_out = tk.StringVar(value="datalight_recovered")
 
     ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
     ttk.Label(opts, text="--depth").grid(row=0, column=1, sticky="e")
@@ -302,8 +304,14 @@ def run_window(initial_paths):
     ttk.Label(opts, text="--exclude (comma separated)").grid(row=1, column=3, columnspan=2, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_exclude, width=36).grid(row=1, column=5, columnspan=3, sticky="ew", pady=(6, 0))
 
-    ttk.Label(opts, text="--extract OUT.zip").grid(row=2, column=0, sticky="e", pady=(6, 0))
-    ttk.Entry(opts, textvariable=v_zip).grid(row=2, column=1, columnspan=6, sticky="ew", pady=(6, 0))
+    ttk.Checkbutton(opts, text="Datalight FlashFX / Reliance", variable=v_datalight).grid(
+        row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ttk.Label(opts, text="Datalight output").grid(row=2, column=2, sticky="e", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_datalight_out, width=32).grid(
+        row=2, column=3, columnspan=3, sticky="ew", pady=(6, 0))
+
+    ttk.Label(opts, text="--extract OUT.zip").grid(row=3, column=0, sticky="e", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_zip).grid(row=3, column=1, columnspan=6, sticky="ew", pady=(6, 0))
 
     def pick_zip():
         p = filedialog.asksaveasfilename(title="Extraction zip", defaultextension=".zip",
@@ -311,7 +319,7 @@ def run_window(initial_paths):
         if p:
             v_zip.set(p)
 
-    ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=2, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
+    ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=3, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
     for c in (1, 5, 6):
         opts.columnconfigure(c, weight=1)
 
@@ -414,6 +422,20 @@ def run_window(initial_paths):
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
         args = probe_command() + ["--progress"]
+        if v_datalight.get():
+            if extract:
+                messagebox.showinfo("qnxprobe", "Datalight/Reliance recovery writes its own directory tree; use Run report, not Extract to zip.")
+                return None
+            if len(paths) != 1:
+                messagebox.showinfo("qnxprobe", "Datalight/Reliance currently accepts one raw NAND image at a time.")
+                return None
+            outdir = v_datalight_out.get().strip() or "datalight_recovered"
+            # This mode is a dedicated raw-NAND reconstruction pipeline. Do not
+            # append the normal filesystem scan/list options: they run a second,
+            # incompatible discovery pass over the physical NAND.
+            args += ["--datalight", "--datalight-output", outdir]
+            state["child_env"] = dict(os.environ)
+            return args + paths
         try:
             args += ["--scan-limit", str(int(v_scan.get()))]
             if v_list.get():
