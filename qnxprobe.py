@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.58"
+QNXPROBE_VERSION = "1.59"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -6862,7 +6862,7 @@ class EfsWalker:
     def __init__(self, fh, base):
         self.fh, self.base = fh, base
         self.unit_size = _efs_unit_size(fh, base)
-        boot = _efs_boot(fh, base, min(self.unit_size * 4, 1 << 24))
+        boot = _efs_boot(fh, base, 1 << 24)
         self.boot = boot
         self.align = boot["align_pow2"]
         self.units = [read_at(fh, base + u * self.unit_size, self.unit_size)
@@ -10822,7 +10822,7 @@ def identify_efs(fh, base, size):
     us = _efs_unit_size(fh, base)
     if us is None:
         return None
-    boot = _efs_boot(fh, base, min(us * 4, 1 << 24))
+    boot = _efs_boot(fh, base, min(size, 1 << 24))
     if boot is None:
         return None
     if boot["unit_total"] < 1 or boot["unit_total"] * us > size:
@@ -12354,6 +12354,27 @@ def flash_regions(fh, size):
                 if (pos + j) % FLASH_ALIGN == 0:
                     hits.add((pos + j, magic))
                 j = chunk.find(magic, j + 1)
+        # EFS/F3S puts QSSL_F3S inside its boot extent, not necessarily in unit 0.
+        # Recover the containing erase unit and use boot_info.unit_index to get
+        # the filesystem base. This also handles dumps without a partition table.
+        j = chunk.find(EFS_SIG)
+        while 0 <= j < step:
+            sig = pos + j
+            if sig >= 4:
+                bi = read_at(fh, sig - 4, 24)
+                if (len(bi) == 24 and struct.unpack_from("<H", bi, 0)[0] == 0x18
+                        and bi[2:4] == b"\x03\x00"):
+                    unit_index = struct.unpack_from("<H", bi, 12)[0]
+                    for unit_pow2 in range(9, 31):
+                        us = 1 << unit_pow2
+                        unit_start = sig & ~(us - 1)
+                        if _efs_unit_size(fh, unit_start) != us:
+                            continue
+                        base = unit_start - unit_index * us
+                        if base >= 0 and base % FLASH_ALIGN == 0:
+                            hits.add((base, b"efs"))
+                        break
+            j = chunk.find(EFS_SIG, j + 1)
         m = EXT_SB_OFF + EXT_F["magic"]                # pos is a multiple of FLASH_ALIGN
         for k in range(0, min(step, len(chunk) - m - 1), FLASH_ALIGN):
             if chunk[k + m:k + m + 2] == b"\x53\xef":
@@ -12387,6 +12408,13 @@ def flash_regions(fh, size):
                 else:
                     break
             found.append(["ubi", off, end - off])
+        elif magic == b"efs":
+            us = _efs_unit_size(fh, off)
+            boot = _efs_boot(fh, off, min(size - off, 1 << 24)) if us else None
+            ext = boot["unit_total"] * us if boot else 0
+            if not ext or ext > size - off or not identify_efs(fh, off, ext):
+                continue
+            found.append(["efs", off, ext])
         elif magic == b"ext":
             ext = _ext_primary_size(fh, off, size - off)
             if not ext:
