@@ -25,6 +25,31 @@ T=8
 PRIM=0x201B
 N=(1<<M)-1
 
+# Degree-104 BCH generator for m=13/t=8. The stored 13 parity bytes are
+# the systematic polynomial remainder, MSB first. A 256-entry byte table
+# makes the overwhelmingly common "ECC already matches" path cheap.
+GEN=0x115f914e07b0c138741c5c4fb23
+GEN_DEG=104
+GEN_MASK=(1<<GEN_DEG)-1
+_PARITY_TABLE=[]
+for _b in range(256):
+    _r=_b << (GEN_DEG-8)
+    for _ in range(8):
+        _r = ((_r << 1) ^ GEN) if (_r & (1 << (GEN_DEG-1))) else (_r << 1)
+        _r &= GEN_MASK
+    _PARITY_TABLE.append(_r)
+
+def _parity(payload):
+    """Return the 13 stored BCH parity bytes for a 516-byte payload."""
+    r=0
+    for b in payload:
+        top=(r >> (GEN_DEG-8)) & 0xff
+        r=((r << 8) & GEN_MASK) ^ _PARITY_TABLE[top ^ b]
+    for _ in range(ECC_BYTES):
+        top=(r >> (GEN_DEG-8)) & 0xff
+        r=((r << 8) & GEN_MASK) ^ _PARITY_TABLE[top]
+    return r.to_bytes(ECC_BYTES,"big")
+
 # GF(2^13) tables
 _EXP=[0]*(2*N)
 _LOG=[-1]*(1<<M)
@@ -105,6 +130,9 @@ def process_page(page):
         pad=page[b+530:b+532]
         # Erased/unprogrammed codewords need no BCH work.
         if payload==b"\xff"*DATA_BYTES and ecc==b"\xff"*ECC_BYTES:
+            fixed=payload; clean+=1
+        elif _parity(payload)==ecc:
+            # Fast path: clean codeword; skip syndrome/BM/Chien completely.
             fixed=payload; clean+=1
         else:
             fixed,n,status=_correct_codeword(payload,ecc)
