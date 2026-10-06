@@ -306,6 +306,8 @@ def run_window(initial_paths):
 
     ttk.Checkbutton(opts, text="Datalight FlashFX / Reliance", variable=v_datalight).grid(
         row=2, column=0, columnspan=2, sticky="w", pady=(6, 0))
+    ttk.Checkbutton(opts, text="Qualcomm-Kombox (ECC + Stuff entfernen)", variable=v_kombox).grid(
+        row=2, column=6, columnspan=2, sticky="w", pady=(6, 0), padx=(12, 0))
     ttk.Label(opts, text="Datalight output").grid(row=2, column=2, sticky="e", pady=(6, 0))
     ttk.Entry(opts, textvariable=v_datalight_out, width=32).grid(
         row=2, column=3, columnspan=3, sticky="ew", pady=(6, 0))
@@ -422,6 +424,11 @@ def run_window(initial_paths):
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
         args = probe_command() + ["--progress"]
+        if v_kombox.get() and v_datalight.get():
+            messagebox.showinfo("qnxprobe", "Qualcomm-Kombox and Datalight are separate NAND layouts; select only one.")
+            return None
+        if v_kombox.get():
+            args.append("--qualcomm-kombox")
         if v_datalight.get():
             if extract:
                 messagebox.showinfo("qnxprobe", "Datalight/Reliance recovery writes its own directory tree; use Run report, not Extract to zip.")
@@ -578,6 +585,12 @@ def run_window(initial_paths):
             except OSError:
                 pass
         state.update(fh=None, volumes=[], nodes={}, image_path=None)
+        if state.get("kombox_temp"):
+            try:
+                os.remove(state["kombox_temp"])
+            except OSError:
+                pass
+            state["kombox_temp"] = None
         tree.delete(*tree.get_children())
         b_save["state"] = "disabled"
 
