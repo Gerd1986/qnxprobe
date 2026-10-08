@@ -16,3 +16,13 @@ Reports go to the case module directory under `QNXProbe/datasource_<id>_report.t
 - Does not invoke `--extract` yet; that will be a separate opt-in phase.
 - The plugin has not yet been run inside a local Autopsy 4.23.1 installation.
 - Validate process cancellation and multi-segment evidence with real fixtures before production forensic use.
+
+## Experimental free-space export and ZIP extraction
+
+The plugin runs `export_free_extents.py` using the same CPython interpreter and writes `datasource_<id>_free_extents.json`. Only walkers implementing `free_extents()` are included. Empty results do **not** prove that the filesystem has no free blocks. These extents are not automatically imported as Autopsy unallocated files.
+
+Set `QNXPROBE_EXTRACT=1` before launching Autopsy to additionally run `qnxprobe.py --extract <zip> <image>`. This produces `datasource_<id>_recovered.zip` in the module output directory. Extracted files are **not yet inserted into the Autopsy file tree**. The ZIP may be large.
+
+Do not use these outputs as evidence of deleted files without validating the filesystem's allocation metadata. Partition gaps and NAND stale pages are not yet covered.
+
+This is an untested integration prototype: verify `qnxprobe.volumes()`, image handle semantics, the Autopsy Jython module lifecycle, and the exact extraction results on known fixtures before casework.
