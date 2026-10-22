@@ -38,6 +38,9 @@ import queue
 import threading
 import subprocess
 import runpy
+import tempfile
+import zipfile
+import tarfile
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -107,6 +110,73 @@ def check_discovery(paths):
 # ---------------------------------------------------------------------------
 # The window
 # ---------------------------------------------------------------------------
+
+def forensic_entries(walker, category, image_size):
+    """Lazy forensic children; offsets are in the opened logical image."""
+    if category == "unallocated":
+        for off, length in walker.free_extents():
+            length = min(length, image_size - off)
+            if off >= 0 and length > 0:
+                yield (f"0x{off:016X}.bin", ("extent", off), length,
+                       "unallocated", f"image offset 0x{off:X}")
+    else:
+        discover = getattr(walker, "deleted_files", None) or walker.recover_deleted
+        for entry in discover():
+            readable = entry.recoverable and not entry.is_dir
+            notes = [getattr(entry, "reason", ""), getattr(entry, "note", "")]
+            if getattr(entry, "assumed_contiguous", False):
+                notes.append("contiguity assumed")
+            parent = getattr(entry, "parent_path", None)
+            notes.append(f"parent: {parent if parent is not None else entry.parent}")
+            yield (entry.name, ("deleted", entry), entry.size if readable else None,
+                   "deleted file" if readable else "unrecoverable", "; ".join(n for n in notes if n))
+
+
+def content_chunks(walker, image_fh, node, size):
+    """Stream live files, deleted files, and free extents without changing evidence."""
+    if isinstance(node, tuple) and node and node[0] == "extent":
+        at, left = node[1], size
+        while left:
+            data = q.read_at(image_fh, at, min(left, 1024 * 1024))
+            if not data:
+                raise EOFError(f"unreadable image offset 0x{at:X}")
+            yield data
+            at += len(data)
+            left -= len(data)
+    elif isinstance(node, tuple) and node and node[0] == "deleted":
+        yield from walker.read_deleted(node[1], size)
+    else:
+        yield from walker.read_file(node, size)
+
+
+def archive_listing(chunks, max_bytes=256 * 1024 * 1024, max_entries=10000):
+    """List ZIP/TAR metadata without extracting or decompressing member contents."""
+    with tempfile.SpooledTemporaryFile(max_size=8 * 1024 * 1024) as source:
+        total = 0
+        for chunk in chunks:
+            total += len(chunk)
+            if total > max_bytes:
+                raise ValueError("archive preview is limited to 256 MiB")
+            source.write(chunk)
+        source.seek(0)
+        if zipfile.is_zipfile(source):
+            source.seek(0)
+            with zipfile.ZipFile(source) as archive:
+                entries = archive.infolist()
+                rows = [f"{e.file_size:>12,}  {e.filename}" for e in entries[:max_entries]]
+                if len(entries) > max_entries:
+                    rows.append("[entry limit reached]")
+                return "\n".join(rows)
+        source.seek(0)
+        # Uncompressed TAR only: compressed streams can expand without bound.
+        with tarfile.open(fileobj=source, mode="r:") as archive:
+            rows = []
+            for i, entry in enumerate(archive):
+                if i >= max_entries:
+                    rows.append("[entry limit reached]")
+                    break
+                rows.append(f"{entry.size:>12,}  {entry.name}")
+            return "\n".join(rows)
 
 def run_window(initial_paths):
     import tkinter as tk
@@ -371,6 +441,10 @@ def run_window(initial_paths):
     b_load.pack(side="left")
     b_save = ttk.Button(cbar, text="Save selected file...", state="disabled")
     b_save.pack(side="left", padx=(6, 0))
+    b_view = ttk.Button(cbar, text="View bytes...", state="disabled")
+    b_view.pack(side="left", padx=(6, 0))
+    b_archive = ttk.Button(cbar, text="List archive...", state="disabled")
+    b_archive.pack(side="left", padx=(6, 0))
 
     # Created and Accessed fill where the walker keeps instants for them, which
     # is NTFS through stamps(); every other reader carries only the modified
@@ -606,6 +680,7 @@ def run_window(initial_paths):
             state["ftl100_temp"] = None
         tree.delete(*tree.get_children())
         b_save["state"] = "disabled"
+        b_view["state"] = b_archive["state"] = "disabled"
 
     def load_contents():
         path = combo.get()
@@ -712,6 +787,14 @@ def run_window(initial_paths):
             if w is not None:
                 state["nodes"][iid] = (i, w.root, True, None)
                 tree.insert(iid, "end", text="loading...", values=("", "", "", "", "", ""))
+                for category, available in (
+                        ("unallocated", hasattr(w, "free_extents")),
+                        ("deleted", hasattr(w, "deleted_files") or hasattr(w, "recover_deleted"))):
+                    if available:
+                        group = tree.insert(iid, "end", text=f"[{category}]",
+                                            values=("forensic", "", "", "", "", ""))
+                        state["nodes"][group] = (i, ("forensic", category), True, None)
+                        tree.insert(group, "end", text="loading...")
             else:
                 tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", "", "", "", ""))
         done_loading()
@@ -724,11 +807,27 @@ def run_window(initial_paths):
         if node is None or not node[2]:
             return
         kids = tree.get_children(iid)
-        if not (len(kids) == 1 and tree.item(kids[0], "text") == "loading..."):
+        placeholders = [kid for kid in kids if tree.item(kid, "text") == "loading..."]
+        if not placeholders:
             return
-        tree.delete(*kids)
+        tree.delete(*placeholders)
         vi, ino, _isdir, _ = node
         w = state["volumes"][vi].get("walker") or state["volumes"][vi].get("datalight_walker")
+        if isinstance(ino, tuple) and ino and ino[0] == "forensic":
+            try:
+                count = 0
+                for name, key, size, kind, note in forensic_entries(
+                        w, ino[1], q.image_size(state["fh"])):
+                    cid = tree.insert(iid, "end", text=name,
+                                      values=(kind, q.human(size) if size is not None else "",
+                                              "", "", "", note))
+                    state["nodes"][cid] = (vi, key, False, size)
+                    count += 1
+                if not count:
+                    tree.insert(iid, "end", text="No entries reported (allocation map may be unavailable).")
+            except Exception as exc:
+                tree.insert(iid, "end", text=f"could not list: {exc}")
+            return
         try:
             readings = hasattr(w, "listdir_records")
             entries = list(w.listdir_records(ino)) if readings \
@@ -761,6 +860,43 @@ def run_window(initial_paths):
     def selected(_event=None):
         node = state["nodes"].get(tree.focus())
         b_save["state"] = "normal" if node and not node[2] and node[3] is not None else "disabled"
+        b_view["state"] = b_archive["state"] = b_save["state"]
+
+    def show_content(archive=False):
+        iid = tree.focus()
+        node = state["nodes"].get(iid)
+        if not node or node[2] or node[3] is None:
+            return
+        vi, ino, _d, size = node
+        w = state["volumes"][vi].get("walker") or state["volumes"][vi].get("datalight_walker")
+        if archive and size > 256 * 1024 * 1024:
+            messagebox.showinfo("qnxprobe", "Archive listing is limited to 256 MiB. Save the file to inspect larger archives.")
+            return
+        try:
+            if archive:
+                body = archive_listing(content_chunks(w, state["fh"], ino, size))
+            else:
+                data = bytearray()
+                for chunk in content_chunks(w, state["fh"], ino, min(size, 65536)):
+                    data.extend(chunk[:65536 - len(data)])
+                    if len(data) >= 65536:
+                        break
+                body = f"First {len(data):,} of {size:,} bytes; offsets relative to selection.\n\n"
+                for at in range(0, len(data), 16):
+                    row = data[at:at + 16]
+                    body += f"{at:08X}  {row.hex(' '):47}  " + "".join(chr(b) if 32 <= b < 127 else "." for b in row) + "\n"
+            win = tk.Toplevel(root)
+            win.title(tree.item(iid, "text"))
+            win.geometry("900x600")
+            viewer = tk.Text(win, wrap="none", font=mono)
+            scroll = ttk.Scrollbar(win, command=viewer.yview)
+            viewer.configure(yscrollcommand=scroll.set)
+            scroll.pack(side="right", fill="y")
+            viewer.pack(fill="both", expand=True)
+            viewer.insert("1.0", body or "Empty archive")
+            viewer.configure(state="disabled")
+        except Exception as exc:
+            messagebox.showerror("qnxprobe", f"Could not preview (ZIP or uncompressed TAR required for archive listing):\n{exc}")
 
     def save_file():
         iid = tree.focus()
@@ -768,14 +904,14 @@ def run_window(initial_paths):
         if not node or node[2] or node[3] is None:
             return
         vi, ino, _d, size = node
-        w = state["volumes"][vi]["walker"]
+        w = state["volumes"][vi].get("walker") or state["volumes"][vi].get("datalight_walker")
         out = filedialog.asksaveasfilename(title="Save file as", initialfile=tree.item(iid, "text"))
         if not out:
             return
         try:
             n = 0
             with open(out, "wb") as f:
-                for chunk in w.read_file(ino, size):
+                for chunk in content_chunks(w, state["fh"], ino, size):
                     f.write(chunk)
                     n += len(chunk)
             status["text"] = f"saved {n:,} bytes to {out}"
@@ -789,6 +925,8 @@ def run_window(initial_paths):
     tree.bind("<Double-1>", lambda e: save_file() if b_save["state"] == "normal" else None)
     b_load.configure(command=load_contents)
     b_save.configure(command=save_file)
+    b_view.configure(command=show_content)
+    b_archive.configure(command=lambda: show_content(True))
 
     def on_close():
         cancel()
