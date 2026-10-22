@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.62-datalight"
+QNXPROBE_VERSION = "1.63-ftl"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -15226,7 +15226,11 @@ def self_test():
         fat = bytearray(64 * 1024)
         fat[82:90] = b"FAT32   "
         struct.pack_into("<H", fat, 11, 512); fat[13] = 1
-        struct.pack_into("<I", fat, 32, 96)
+        # A partial image with a valid FAT32 BPB: 70,000 data clusters.
+        struct.pack_into("<H", fat, 14, 32); fat[16] = 2
+        struct.pack_into("<I", fat, 32, 71232)
+        struct.pack_into("<I", fat, 36, 600)
+        struct.pack_into("<I", fat, 44, 2)
         fat[510:512] = b"\x55\xaa"
         fp = os.path.join(d, "fat32.img"); open(fp, "wb").write(fat)
 
