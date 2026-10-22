@@ -290,6 +290,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           sed "s/{{VERSION}}/${GITHUB_REF_NAME}/g" packaging/release-notes.md > notes.md
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --title "qnxprobe ${GITHUB_REF_NAME}" \
-            --notes-file notes.md
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" artifacts/* --clobber
+            gh release edit "$GITHUB_REF_NAME" --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" artifacts/* \
+              --title "qnxprobe ${GITHUB_REF_NAME}" \
+              --notes-file notes.md
+          fi
