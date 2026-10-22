@@ -68,7 +68,7 @@ jobs:
       - name: Self-test from source
         run: python qnxprobe.py --self-test
 
-      - name: Test GUI content paths and NAND JSON integration
+      - name: Test NAND JSON integration
         run: python -m unittest discover -s tests -p "test_*.py" -v
 
       - name: Build the command line executable

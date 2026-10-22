@@ -9,25 +9,6 @@ Each archive holds the command line tool, the window (a `.app` bundle on macOS),
 
 The Python files themselves need nothing built: `python3 qnxprobe.py` works on macOS, Linux and Windows with the standard library alone. See the README for what each release of the tool reads.
 
-## Content viewer: free space and deleted files
-
-- Expand `[unallocated]` beneath a volume to browse the free extents its reader
-  reports. Names and notes show absolute offsets in the opened logical image;
-  ranges are clipped to the available image. Save streams the selected extent.
-- Expand `[deleted]` for deleted files reported by NTFS, FAT32, exFAT and the
-  supported flash readers. Unrecoverable entries stay visible with the reader's
-  reason. FAT recovery displays when contiguity was assumed.
-- `View bytes...` shows the first 64 KiB of a live/deleted file or free extent.
-- `List archive...` lists ZIP and uncompressed TAR entries from a selected live
-  or recoverable deleted file. It never extracts members. Preview is limited to
-  256 MiB and 10,000 displayed entries. Other formats can be saved for external
-  inspection. This is metadata-based recovery, not archive signature carving.
-- Filesystems without allocation/deletion APIs do not gain inferred results.
-  APFS free space belongs to the container and may contain encrypted bytes.
-
-Validation: fixture hashes for deleted NTFS/FAT32/exFAT files, raw free-extent
-byte comparisons, partial-image clipping, ZIP/TAR listing and preview bounds.
-
 ## JSON-configured NAND preprocessing
 
 Load an existing Autopsy-compatible NAND JSON config in the GUI, select an
