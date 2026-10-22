@@ -68,15 +68,18 @@ jobs:
       - name: Self-test from source
         run: python qnxprobe.py --self-test
 
+      - name: Test GUI content paths and NAND JSON integration
+        run: python -m unittest discover -s tests -p "test_*.py" -v
+
       - name: Build the command line executable
         run: >
           pyinstaller --noconfirm --clean --onefile --console
-          --name qnxprobe --hidden-import ewfprobe qnxprobe.py
+          --name qnxprobe --hidden-import ewfprobe --hidden-import nand_tools qnxprobe.py
 
       - name: Build the window executable
         run: >
           pyinstaller --noconfirm --clean --onefile --windowed
-          --name qnxprobe_gui --hidden-import qnxprobe --hidden-import ewfprobe
+          --name qnxprobe_gui --hidden-import qnxprobe --hidden-import ewfprobe --hidden-import nand_tools
           qnxprobe_gui.py
 
       - name: Keep the self-test's synthetic images as fixtures
@@ -242,6 +245,8 @@ jobs:
           name="qnxprobe-${GITHUB_REF_NAME//\//-}-${{ matrix.label }}"
           mkdir -p "pkg/$name"
           cp packaging/README.txt LICENSE "pkg/$name/"
+          cp -R nand_tools/profiles "pkg/$name/nand-profiles"
+          cp nand_tools/LICENSE.txt "pkg/$name/LICENSE-nand.txt"
           if [ "$RUNNER_OS" = "Windows" ]; then
             cp dist/qnxprobe.exe dist/qnxprobe_gui.exe "pkg/$name/"
             (cd "pkg/$name" && sha256sum qnxprobe.exe qnxprobe_gui.exe > SHA256SUMS.txt && cat SHA256SUMS.txt)

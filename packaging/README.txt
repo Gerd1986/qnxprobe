@@ -40,3 +40,13 @@ workflow, and are not code signed:
 Builds: windows-x64, windows-arm64 (native for Windows on ARM; the x64 build
 also runs there through emulation), macos-arm64 (Apple silicon), macos-x64
 (Intel), linux-x64, linux-arm64.
+
+NAND JSON configurations (FTL branch)
+-----------------------------------
+Use Load JSON... in the window, choose a device configuration and a NAND output
+folder, then Load contents / Run report / Extract to zip. Existing Autopsy
+schema-v1 NAND profiles are supported. Example profiles are in nand-profiles/;
+the synthetic profile is for testing only. Each run keeps logical.img, the exact
+profile copy and a SHA-256/correction/mapping report in a new nand-* subfolder.
+Content offsets refer to the reconstructed logical image. JSON processing uses
+ECC and stops on uncorrectable BCH. Select one preprocessing mode per run.

@@ -27,3 +27,13 @@ The Python files themselves need nothing built: `python3 qnxprobe.py` works on m
 
 Validation: fixture hashes for deleted NTFS/FAT32/exFAT files, raw free-extent
 byte comparisons, partial-image clipping, ZIP/TAR listing and preview bounds.
+
+## JSON-configured NAND preprocessing
+
+Load an existing Autopsy-compatible NAND JSON config in the GUI, select an
+output folder and open the reconstructed image directly in Contents. Report and
+ZIP extraction use the same backend through --nand-profile and --nand-output.
+Per-run logical images, profile copies and hash/correction/LBA audit reports are
+retained. BCH correction, stuff/spare removal and explicit optional LBA mapping
+use the existing standard-library NAND engine. Fixed Datalight/FTL100/Qualcomm
+modes remain separate choices.

@@ -2095,3 +2095,39 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## NAND preprocessing with JSON configurations (FTL branch)
+
+In the window, choose **Load JSON...** next to **NAND JSON config**. This enables
+that mode and displays the profile ID, page geometry, BCH coverage and whether
+LBA mapping is configured. Select a **NAND output folder**, then use **Load
+contents**, **Run report** or **Extract to zip**. Reconstruction runs in the
+Contents worker thread; Report and Extract run in their normal subprocess.
+Progress reports pages processed and corrected bits.
+
+The configuration uses the same schema-v1 format as Autopsy's `Tools/nand`.
+Existing compatible JSON files can be loaded directly. The supplied observed
+profile is `nand_tools/profiles/qualcomm-kommbox-4352.json`; executable packages
+include it under `nand-profiles/`. The `synthetic-lba-bch-fat32.json` profile is
+only a test layout, not a real device preset.
+
+```sh
+python qnxprobe.py --nand-profile device.json --nand-output recovered --list chip.bin
+python qnxprobe.py --nand-profile device.json --nand-output recovered --extract files.zip chip.bin
+```
+
+Each run creates a new `nand-*` directory containing `logical.img`, an exact
+`device-profile.json` copy and `logical.img.report.json`. The report records
+input/output/profile SHA-256, correction counters, geometry and any configured
+LBA mapping, duplicate decisions and missing ranges. Images and reports are
+retained when the viewer closes. Content-viewer and unallocated offsets refer
+to the **logical image**, not raw NAND offsets; mapping provenance is in the
+report. Read the report's status and hole policy when inspecting mapped images.
+
+ECC is enabled and uncorrectable BCH aborts processing. No code is loaded from
+the JSON. The existing Datalight, FTL100 and fixed Qualcomm mode remain available;
+select one preprocessing mode per run. JSON mapping is an explicit page/LBA
+layout, not an automatic decoder of arbitrary proprietary FTLs. Supported ECC
+is byte-aligned, systematic MSB-first shortened BCH; other bit orders,
+XOR/inversion, scrambling and parity padding are not guessed. See
+`nand_tools/profiles/README.md` and `nand_tools/NAND_LBA_MAPPING.md`.

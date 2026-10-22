@@ -360,6 +360,9 @@ def run_window(initial_paths):
     v_datalight = tk.BooleanVar(value=False)
     v_kombox = tk.BooleanVar(value=False)
     v_ftl100 = tk.BooleanVar(value=False)
+    v_nand = tk.BooleanVar(value=False)
+    v_nand_profile = tk.StringVar(value="")
+    v_nand_output = tk.StringVar(value=os.path.abspath("nand_preprocessed"))
     v_datalight_out = tk.StringVar(value="datalight_recovered")
 
     ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
@@ -396,6 +399,44 @@ def run_window(initial_paths):
             v_zip.set(p)
 
     ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=4, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
+    ttk.Checkbutton(opts, text="NAND JSON config", variable=v_nand).grid(
+        row=5, column=0, sticky="w", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_nand_profile).grid(
+        row=5, column=1, columnspan=6, sticky="ew", pady=(6, 0))
+
+    def pick_nand_profile():
+        path = filedialog.askopenfilename(title="NAND device configuration",
+                                         filetypes=[("JSON config", "*.json"), ("All files", "*")])
+        if path:
+            try:
+                import nand_tools
+                profile = nand_tools.Profile(path)
+            except (OSError, ValueError) as exc:
+                messagebox.showerror("NAND config", str(exc))
+                return
+            v_nand_profile.set(path)
+            v_nand.set(True)
+            v_datalight.set(False)
+            v_kombox.set(False)
+            v_ftl100.set(False)
+            messagebox.showinfo("NAND config", f"{profile.id}\n{profile.physical} -> {profile.logical} bytes/page\n"
+                                + ("LBA mapping enabled\n" if profile.mapping else "")
+                                + f"{profile.unprotected_bytes} unprotected output bytes/page\n"
+                                  "ECC on; uncorrectable BCH aborts processing.")
+
+    ttk.Button(opts, text="Load JSON...", command=pick_nand_profile).grid(
+        row=5, column=7, sticky="w", padx=(6, 0), pady=(6, 0))
+    ttk.Label(opts, text="NAND output folder").grid(row=6, column=0, sticky="e", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_nand_output).grid(
+        row=6, column=1, columnspan=6, sticky="ew", pady=(6, 0))
+
+    def pick_nand_output():
+        path = filedialog.askdirectory(title="NAND output folder")
+        if path:
+            v_nand_output.set(path)
+
+    ttk.Button(opts, text="Choose folder...", command=pick_nand_output).grid(
+        row=6, column=7, sticky="w", padx=(6, 0), pady=(6, 0))
     for c in (1, 5, 6):
         opts.columnconfigure(c, weight=1)
 
@@ -496,16 +537,27 @@ def run_window(initial_paths):
     q_out = queue.Queue()
     q_con = queue.Queue()
 
+    def flash_options_valid():
+        if sum(bool(v.get()) for v in (v_nand, v_kombox, v_datalight, v_ftl100)) > 1:
+            messagebox.showinfo("qnxprobe", "NAND JSON, FTL100, Qualcomm-Kombox and Datalight are separate modes; select only one.")
+            return False
+        if v_nand.get():
+            if not os.path.isfile(v_nand_profile.get().strip()) or not v_nand_output.get().strip():
+                messagebox.showinfo("qnxprobe", "Choose a NAND JSON config and output folder first.")
+                return False
+        return True
+
     def build_args(extract):
         paths = list(images.get(0, "end"))
         if not paths:
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
         args = probe_command() + ["--progress"]
-        selected_flash = sum(bool(v.get()) for v in (v_kombox, v_datalight, v_ftl100))
-        if selected_flash > 1:
-            messagebox.showinfo("qnxprobe", "FTL100, Qualcomm-Kombox and Datalight are separate flash layouts; select only one.")
+        if not flash_options_valid():
             return None
+        if v_nand.get():
+            args += ["--nand-profile", v_nand_profile.get().strip(),
+                     "--nand-output", v_nand_output.get().strip()]
         if v_ftl100.get():
             args.append("--ftl100")
         if v_kombox.get():
@@ -552,7 +604,7 @@ def run_window(initial_paths):
         # An encrypted image's password goes to the subprocess in its environment,
         # never on its command line, where the process list would show it.
         for path in paths:
-            if not unlock(path) or not unlock_volumes(path):
+            if not any(v.get() for v in (v_nand, v_ftl100, v_kombox, v_datalight)) and (not unlock(path) or not unlock_volumes(path)):
                 return None
         env = dict(os.environ)
         env["PYTHONUNBUFFERED"] = "1"
@@ -609,6 +661,10 @@ def run_window(initial_paths):
                 else:
                     try:
                         j = json.loads(line)
+                        if j.get("phase") == "nand":
+                            progress["value"] = 100.0 * j["pages"] / max(1, j["total_pages"])
+                            status["text"] = f"NAND {j['pages']:,}/{j['total_pages']:,} pages; {j['corrected_bits']:,} corrected bits"
+                            continue
                         tb = j.get("total_bytes") or 0
                         if tb:
                             progress["value"] = 100.0 * j.get("bytes", 0) / tb
@@ -687,24 +743,30 @@ def run_window(initial_paths):
         if not path:
             messagebox.showinfo("qnxprobe", "Add an image and pick it in the list.")
             return
+        if not flash_options_valid():
+            return
+        nand_profile = v_nand_profile.get().strip() if v_nand.get() else None
+        nand_output = v_nand_output.get().strip()
+        use_datalight, use_kombox, use_ftl100 = v_datalight.get(), v_kombox.get(), v_ftl100.get()
         close_image()
         b_load["state"] = "disabled"
         status["text"] = f"reading {os.path.basename(path)} ..."
 
-        if not unlock(path):                 # an encrypted image, its password refused
+        if not nand_profile and not unlock(path):
             done_loading()
             return
         # A raw Datalight NAND must not go through the normal BitLocker/APFS
         # volume discovery first; that is both irrelevant and very expensive.
-        if not v_datalight.get() and not v_kombox.get() and not v_ftl100.get() and not unlock_volumes(path):
+        if not nand_profile and not use_datalight and not use_kombox and not use_ftl100 and not unlock_volumes(path):
             done_loading()
             return
 
         def work():
             # Tk is not thread safe, so the worker only reads; the result is
             # picked up by poll_contents() on the main thread.
+            fh = None
             try:
-                if v_datalight.get():
+                if use_datalight:
                     # Dedicated raw-NAND path: do not open/scan it through the
                     # normal qnxprobe volume stack first.
                     import datalight_reliance as dl
@@ -712,13 +774,20 @@ def run_window(initial_paths):
                     q_con.put(("datalight", path, None, vols))
                 else:
                     open_path = path
-                    if v_ftl100.get():
+                    if nand_profile:
+                        import nand_tools
+                        def np(done, total, counts):
+                            q_con.put(("status", path, None,
+                                       f"NAND {done:,}/{total:,} pages; {counts['corrected_bits']:,} corrected bits"))
+                        open_path, stats = nand_tools.prepare(path, nand_profile, nand_output, progress=np)
+                        q_con.put(("nand_ready", path, None, (open_path, stats)))
+                    if use_ftl100:
                         import ftl100
                         open_path, stats = ftl100.preprocess(path)
                         state["ftl100_temp"] = open_path
                         q_con.put(("status", path, None,
                                    f"FTL100: {stats['recovered_sectors']:,} sectors, {stats['data_units']:,} data units"))
-                    if v_kombox.get():
+                    if use_kombox:
                         import qualcomm_kombox
                         def kp(done, total, corr, bad):
                             if done == total or done % 8192 == 0:
@@ -728,7 +797,7 @@ def run_window(initial_paths):
                         state["kombox_temp"] = open_path
                     fh = q.open_image(open_path, password=state["passwords"].get(path),
                                       private_key=state["aff_keys"].get(path))
-                    if not v_kombox.get() and not v_ftl100.get():
+                    if not nand_profile and not use_kombox and not use_ftl100:
                         fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
                                                         state["bl_secrets"].get(path, []),
                                                         state["bl_keys"].get(path, []))
@@ -736,6 +805,8 @@ def run_window(initial_paths):
                                                     state["bl_secrets"].get(path, []))
                     q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
             except Exception as exc:
+                if fh is not None:
+                    fh.close()
                 q_con.put(("err", path, None, str(exc)))
         threading.Thread(target=work, daemon=True).start()
         root.after(50, poll_contents)
@@ -752,6 +823,12 @@ def run_window(initial_paths):
             show_datalight_volumes(path, payload)
         elif kind == "status":
             status["text"] = payload
+            root.after(50, poll_contents)
+        elif kind == "nand_ready":
+            logical, report = payload
+            append_text(f"NAND {report['profile']} ({report['status']}): {logical}\n"
+                        f"Audit report: {logical}.report.json\n"
+                        "Content-viewer offsets refer to this logical image.\n")
             root.after(50, poll_contents)
         else:
             messagebox.showerror("qnxprobe", f"could not read {path}:\n{payload}")

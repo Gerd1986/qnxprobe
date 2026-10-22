@@ -45,7 +45,7 @@ except ImportError:                  # not on sys.path when imported as a module
     except ImportError:
         ewfprobe = None
 
-QNXPROBE_VERSION = "1.63-ftl"
+QNXPROBE_VERSION = "1.64-ftl"
 
 QNX6_MAGIC     = 0x68191122
 BOOTBLOCK_SIZE = 0x2000
@@ -20267,6 +20267,10 @@ if __name__ == "__main__":
                          "the detector reports both ways, then delete them")
     ap.add_argument("--ftl100", action="store_true",
                     help="reconstruct an M-Systems FTL100 NOR dump to its logical block image, then run normal filesystem discovery")
+    ap.add_argument("--nand-profile", metavar="CONFIG.json",
+                    help="preprocess raw NAND with an Autopsy-compatible schema-v1 JSON device profile, then discover the logical image")
+    ap.add_argument("--nand-output", metavar="DIR", default=None,
+                    help="keep NAND logical images, profile copies and audit reports in new subfolders of DIR (default: nand_preprocessed)")
     ap.add_argument("--qualcomm-kombox", action="store_true",
                     help="preprocess a 4352-byte/page Qualcomm Kommbox NAND: BCH m=13 t=8 ECC correction, remove stuff/ECC/spare bytes, then run normal filesystem discovery on 4096-byte pages")
     ap.add_argument("--datalight", action="store_true",
@@ -20338,6 +20342,11 @@ if __name__ == "__main__":
                     version=f"qnxprobe {QNXPROBE_VERSION}")
     args = ap.parse_args()
 
+    if sum(bool(x) for x in (args.nand_profile, args.ftl100, args.qualcomm_kombox, args.datalight)) > 1:
+        ap.error("NAND JSON, FTL100, Qualcomm-Kombox and Datalight are separate preprocessing modes; select only one")
+    if args.nand_output and not args.nand_profile:
+        ap.error("--nand-output requires --nand-profile")
+
     if args.self_test:
         print("\nqnxprobe self-test\n")
         sys.exit(self_test())
@@ -20369,6 +20378,30 @@ if __name__ == "__main__":
     missing = [p for p in args.image if not os.path.exists(p)]
     if missing:
         sys.exit("not found: " + ", ".join(missing))
+
+    if args.nand_profile:
+        import nand_tools
+        converted = []
+        for path in args.image:
+            def nand_progress(done, total, counts):
+                event = dict(phase="nand", pages=done, total_pages=total,
+                             corrected_bits=counts["corrected_bits"],
+                             uncorrectable_codewords=counts["uncorrectable_codewords"])
+                if args.progress:
+                    print(json.dumps(event), file=sys.stderr, flush=True)
+                else:
+                    print(f"NAND {done:,}/{total:,} pages; {counts['corrected_bits']:,} corrected bits",
+                          file=sys.stderr, flush=True)
+            try:
+                out, stats = nand_tools.prepare(path, args.nand_profile,
+                                               args.nand_output or "nand_preprocessed",
+                                               progress=nand_progress)
+            except (OSError, ValueError) as exc:
+                sys.exit(f"NAND preprocessing failed: {exc}")
+            converted.append(out)
+            print(f"NAND profile {stats['profile']}: {stats['pages']:,} pages, "
+                  f"{stats['corrected_bits']:,} corrected bits; {stats['status']}; logical image: {out}")
+        args.image = converted
 
     # Qualcomm Kommbox raw NAND: correct BCH and strip the interleaved
     # stuff/ECC/spare bytes before the normal UBI/UBIFS/SquashFS discovery.
