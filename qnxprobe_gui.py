@@ -385,6 +385,125 @@ def run_window(initial_paths):
     tree.pack(side="left", fill="both", expand=True)
     tys.pack(side="right", fill="y")
 
+    # ---- signature carving (independent read-only handle) -----------------
+    import qnxprobe_carving as carving
+    car = ttk.Frame(nb)
+    nb.add(car, text="Carving")
+    cb = ttk.Frame(car, padding=6)
+    cb.pack(fill="x")
+    ttk.Label(cb, text="Uses image selected in Contents; scans entire logical image.").pack(anchor="w")
+    ttk.Label(cb, text="Contiguous candidates only; hits may belong to live files. No original names/timestamps.").pack(anchor="w")
+    controls = ttk.Frame(cb)
+    controls.pack(fill="x")
+    types = {k: tk.BooleanVar(value=True) for k in carving.SIGNATURES}
+    for kind, var in types.items():
+        ttk.Checkbutton(controls, text=kind.upper(), variable=var).pack(side="left")
+    ttk.Label(controls, text="Max MiB/file").pack(side="left")
+    max_mib = tk.StringVar(value="64")
+    ttk.Entry(controls, textvariable=max_mib, width=7).pack(side="left")
+    cs = dict(hits={}, path=None, busy=False)
+    cq = queue.Queue()
+    stop_carving = threading.Event()
+    carve_status = tk.StringVar(value="Ready")
+    ttk.Label(cb, textvariable=carve_status).pack(anchor="w")
+    ct = ttk.Treeview(car, columns=("offset", "size", "type", "validation"), show="headings")
+    for col in ("offset", "size", "type", "validation"):
+        ct.heading(col, text=col.title())
+    ct.pack(fill="both", expand=True)
+
+    def poll_carving():
+        for _ in range(200):
+            try:
+                tag, value = cq.get_nowait()
+            except queue.Empty:
+                break
+            if tag == "hit":
+                iid = ct.insert("", "end", values=(hex(value["offset"]), value["size"], value["type"], value["validation"]))
+                cs["hits"][iid] = value
+            elif tag == "progress":
+                carve_status.set(f"Scanning {value:.1%}; {len(cs['hits'])} candidates")
+            else:
+                cs["busy"] = False
+                carve_start["state"] = "normal"
+                carve_export["state"] = "normal"
+                carve_status.set(str(value))
+        if cs["busy"] or not cq.empty():
+            root.after(50, poll_carving)
+
+    def start_carving():
+        path = combo.get()
+        try:
+            limit = int(max_mib.get()) * 1024 * 1024
+            selected = [k for k, var in types.items() if var.get()]
+            if not path or limit <= 0 or not selected:
+                raise ValueError("Select an image, file types and a positive maximum size.")
+        except ValueError as exc:
+            messagebox.showerror("Carving", str(exc))
+            return
+        if not unlock(path):
+            return
+        cs.update(path=path, hits={}, busy=True)
+        ct.delete(*ct.get_children())
+        stop_carving.clear()
+        carve_start["state"] = carve_export["state"] = "disabled"
+        password = state["passwords"].get(path)
+        key = state["aff_keys"].get(path)
+        def work():
+            try:
+                with q.open_image(path, password=password, private_key=key) as fh:
+                    for hit in carving.scan(fh, q.image_size(fh), selected, limit,
+                                            stop_carving.is_set,
+                                            lambda v: cq.put(("progress", v))):
+                        cq.put(("hit", hit))
+                cq.put(("done", "Cancelled (partial results)" if stop_carving.is_set() else "Scan complete"))
+            except Exception as exc:
+                cq.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+        root.after(50, poll_carving)
+
+    def export_carving():
+        hits = [cs["hits"][i] for i in ct.selection()]
+        if not hits:
+            messagebox.showinfo("Carving", "Select one or more candidates first.")
+            return
+        folder = filedialog.askdirectory(title="Parent folder for a new carving export directory")
+        if not folder:
+            return
+        import tempfile
+        output = tempfile.mkdtemp(prefix="qnxprobe-carving-", dir=folder)
+        path = cs["path"]
+        password = state["passwords"].get(path)
+        key = state["aff_keys"].get(path)
+        cs["busy"] = True
+        carve_start["state"] = carve_export["state"] = "disabled"
+        def work():
+            records = []
+            error = None
+            try:
+                with q.open_image(path, password=password, private_key=key) as fh:
+                    for hit in hits:
+                        if stop_carving.is_set():
+                            break
+                        records.append(carving.export_hit(fh, hit, output))
+            except Exception as exc:
+                error = str(exc)
+            try:
+                with open(os.path.join(output, "carving.json"), "x", encoding="utf-8") as out:
+                    json.dump(dict(image=os.path.abspath(path), hits=records,
+                                   cancelled=stop_carving.is_set(), error=error), out, indent=2)
+                cq.put(("done", f"Exported {len(records)} files to {output}" + (f"; {error}" if error else "")))
+            except Exception as exc:
+                cq.put(("error", str(exc)))
+        stop_carving.clear()
+        threading.Thread(target=work, daemon=True).start()
+        root.after(50, poll_carving)
+
+    carve_start = ttk.Button(controls, text="Scan", command=start_carving)
+    carve_start.pack(side="left", padx=6)
+    ttk.Button(controls, text="Stop", command=stop_carving.set).pack(side="left")
+    carve_export = ttk.Button(controls, text="Export selected...", command=export_carving)
+    carve_export.pack(side="left", padx=6)
+
     def refresh_image_combo():
         vals = list(images.get(0, "end"))
         combo["values"] = vals
@@ -691,6 +810,7 @@ def run_window(initial_paths):
     b_save.configure(command=save_file)
 
     def on_close():
+        stop_carving.set()
         cancel()
         close_image()
         root.destroy()
