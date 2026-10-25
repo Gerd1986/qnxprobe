@@ -2095,3 +2095,24 @@ of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+### Signature file carving
+
+The GUI **Carving** tab scans the image selected in **Contents** in a background
+thread. Choose JPEG, PNG, PDF and/or ZIP, set the maximum candidate size (default
+64 MiB), then Scan. Stop keeps results found so far. Select multiple rows to
+export into a new directory; `carving.json` records logical image offsets, sizes,
+validation level and SHA-256 hashes of exported files. The source is read-only.
+
+CLI: `python qnxprobe_carving.py image.img new_output --types jpg,png,pdf,zip --max-mib 64`
+
+This first implementation scans the entire logical image, including allocated
+space. Hits are candidates, not a determination that files were deleted. Only
+contiguous data is recovered; original paths, names and timestamps are unknown.
+JPEG/PDF use header and first footer boundaries and may be incomplete or false
+positives. PNG chunks are CRC checked; ZIP requires a matching central-directory
+boundary (single-disk, non-ZIP64). JPEG/PDF/ZIP content is not fully decoded or
+validated. Candidates exceeding the configured limit or lacking an end marker
+are omitted. Filesystem free-space selection and fragment reconstruction are not
+implemented. Encrypted filesystem contents require a separately decrypted image;
+container passwords supported by the GUI are reused for opening the image.
