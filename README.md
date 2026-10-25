@@ -558,1540 +558,506 @@ Since 1.50 an encrypted APFS volume whose blocks are ciphertext in the image ope
 its password or its personal recovery key, given the way any password is
 (`--password-file FILE` or `--password-env NAME`, repeatable, each tried against every
 such volume), and is then listed and extracted like any other. The report marks it
-`encrypted, opened with a password`, and the note says so. Without a key that opens it,
-it stays `encrypted and locked, not read`, and the note says what would open it and gives
-the passphrase hint the volume stores, as stored. The window asks for each locked
-volume's password when it loads an image, showing the hint. A file listed while its
-volume was open and asked for again once it is locked (a later session, without the key)
-is refused with `ApfsUnreadable`, never read back as an empty file. From 1.44 to 1.49
-such a volume was named locked and not walked.
-
-This is the software encryption Apple File System Reference (2020-06-22) describes in
-"Encryption" and "Accessing Encrypted Objects", which a Mac uses for external storage and
-for internal storage without hardware encryption. The password, through PBKDF2 with the
-salt and iteration count its unlock record carries, unwraps the key encryption key
-(RFC 3394); that unwraps the volume key; and the volume key decrypts the volume's tree and
-files as AES-XTS. Two details come from libfsapfs's format notes and code at commit
-`f63c83b462275214fc5e4b0919540d892f50b467` rather than from Apple's reference: each keybag
-is itself AES-XTS encrypted with its container's or volume's identifier as both keys (the
-reference says RFC 3394 for that step; the keybags on both test volumes do not unwrap as
-RFC 3394 and do read as AES-XTS), and a file's data is decrypted from its extent's
-`crypto_id`, not from the block it sits in now (`libfsapfs_file_system_data_handle.c`,
-lines 274 to 307). PBKDF2 is HMAC-SHA256, which is what unwraps the key on both test
-volumes. It needs the optional
-`pycryptodome` package, and says so without it.
-
-Not read, and named in the note: a volume whose files use per-file keys (Apple's reference
-ties those to hardware encryption), a volume that was being encrypted, decrypted or given
-a new key when it was imaged (its blocks are then not all in one state), an unlock
-record in the CoreStorage-compatible form (libfsapfs: flag 0x2, AES-128), and an
-institutional recovery key. The internal storage of a Mac with a T2 chip or Apple silicon
-does not open with a password from an image: Apple Platform Security's
-[FileVault page](https://support.apple.com/guide/security/volume-encryption-with-filevault-sec4c6dc1b6e/web)
-says its key encryption key "is protected by a combination of the user's password and
-hardware UID". An acquisition made through such a Mac's own decryption holds the volume
-in the clear, and is read as described above.
-
-From Python, after `unlock_bitlocker()` if the image may hold BitLocker too:
-
-```python
-image = q.open_image(path)
-image, found = q.unlock_apfs(image, passwords=[password])
-for vol in q.volumes(image):
-    print(vol["kind"], vol.get("note", ""))
-```
-
-`unlock_apfs()` returns the image carrying the keys it derived, so every `ApfsWalker`
-made over it (and so `volumes()`, `walk_all()` and every extraction) reads those volumes
-decrypted, and one `ApfsLock` per such volume, opened or not, with `name`, `hint`,
-`unlocked_by` (`password` or `personal recovery key`), `why` (what stops it being opened
-at all) and `locked_note()`.
-
-Checked on two volumes macOS 26 encrypted, which ship gzipped under `tests/fixtures`:
-one encrypted as it was made (`tools/make_apfs_encrypted_fixture.sh`) and one encrypted in
-place after files were written, with a passphrase hint
-(`tools/make_apfs_converted_fixture.sh`). The self-test requires every file on both to
-match what macOS wrote, a wrong password to leave the volume locked with its tree never
-parsed, and the hint to be reported as stored. On every extent record of both volumes
-(5 and 6) `crypto_id` equals the extent's block, so the self-test also moves one extent of a copy to
-another block, as a container shrink would, and requires it to read the same; a reader
-that took the tweak from the block fails there. It refuses copies built with each of the
-shapes named above as not read. A personal recovery key goes through the same steps as a
-password in Apple's reference; no volume carrying one was available to test.
-
-Decryption is the same pure-Python AES-XTS the BitLocker reader uses, about 95 MB/s on an
-Apple M2 Max. Since 1.50 a file is also read in one pass over its extents: before, each
-megabyte of a file read its whole data again, so the largest file of the APFS fixture
-below, 12,288,000 bytes, took 148,840,448 bytes of reads and now takes 12,500,992.
-
-### Checked against The Sleuth Kit
-
-Validated against The Sleuth Kit's APFS support, an entirely separate implementation.
-A 32 MiB container written by macOS itself and populated through its own driver ships
-gzipped under `tests/fixtures`; the self-test walks it and requires all 411 files to
-match hashes `fls` and `icat` recorded from the same image, and
-`tools/make_apfs_fixture.sh` rebuilds it on any Mac as an ordinary user. It carries a
-file in 2,046 extents, a sparse file whose hole is a real one, a compressed file, a
-symbolic link, two names for one inode, a directory of 400 entries so the tree is
-several levels deep, a UTF-16 name and an empty file.
-
-Two defects the comparison found, both in the same place and neither visible by
-reading: the object map's own tree points at blocks while the file-system tree points
-at virtual ids, so reading the first through the second walks whatever happens to sit
-at that offset; and a run of records can begin part way through the leaf before the
-first one whose key matches, so starting at the matching leaf lost 13 of 400 children.
-
-## HFS+
-
-A Mac before APFS is an HFS+ volume, and so is an older iOS device, so `--list` and
-`--extract` read one. The volume is claimed by the `H+` or `HX` signature 1024 bytes
-into the volume together with a geometry that has to make sense.
-
-What it reads: the catalog B-tree in both its index and leaf forms, forks whose
-fragments outgrew the eight extent descriptors a catalog record holds and continue in
-the extents overflow tree, symbolic links, hard links through the private directory
-the volume keeps their indirect nodes in, and files compressed with the `decmpfs`
-attribute in its zlib forms, whether the compressed data sits in the attribute or in
-the resource fork behind a block table. A `--list` names a resource fork that carries
-anything, because that is content the file's own size does not account for. HFSX, the
-case-sensitive variant, is read the same way and reported as itself.
-
-What it does not do: a file compressed with LZVN or LZFSE is listed with its recorded
-size and refuses to be read, since neither is in the standard library.
-
-Validated against The Sleuth Kit, which reads HFS+ through an entirely separate
-implementation. A 24 MiB volume written by macOS itself and populated through its own
-driver carries a fragmented file whose extents spilled into the overflow tree, a
-compressed file, a symbolic link, two names for one file, a file with a resource fork,
-a directory of 400 entries so the catalog is three levels deep, a name that needs
-UTF-16 and an empty file. All 412 of its files come back byte for byte against hashes
-`fls` and `icat` recorded from the same image, and the fixture ships with the tool so
-the self-test compares against it. `tools/make_hfsplus_fixture.sh` rebuilds it on any
-Mac, as an ordinary user, and refuses to finish if the image it wrote does not read
-back as what it meant to write.
-
-Six deliberate breaks each turn a different case red. The one that mattered was the
-B-tree descent: every entry of a directory shares a parent id, so several index entries
-carry that id with different names, and taking the last one that is not greater lands
-on the last leaf of the run. A 400-entry directory came back with 10 children until the
-comparison was strict.
-
-## NTFS
-
-An acquisition of a Windows computer is an NTFS volume, so `--list` and `--extract`
-read one directly. The volume is claimed by the `NTFS` name in its boot sector plus a
-geometry that has to make sense, and an NTFS boot sector is declined as a partition
-table for the same reason a FAT one is: it ends in `0x55AA` and its boot code sits
-where partition entries would be.
-
-What it reads: resident and non-resident data, sparse runs, LZNT1 compressed data,
-files the Windows Overlay Filter compressed with XPRESS (since 1.56),
-attributes that overflowed into other MFT records through `$ATTRIBUTE_LIST`, and
-directory indexes in both the resident `$INDEX_ROOT` and the allocated
-`$INDEX_ALLOCATION` form, with the sector fixups put back. Bytes past a file's
-initialized size read as zero, which is what the format says and what a database that
-preallocates its file depends on. An LZNT1 compression unit that stops before it is full
-reads as zeros from there (since 1.57, see
-[NTFS compression units that stop early](#ntfs-compression-units-that-stop-early)). A
-`--list` also names any alternate data stream it finds, because a stream is content the
-file's own size does not account for.
-
-What `--list` does not do: it lists what the directory indexes hold, so an 8.3 name
-indexed beside a long one is skipped rather than listed twice, and an encrypted file is
-listed with its recorded size and refuses to be read, since the volume holds no key.
-Since 1.56 a cloud provider's online-only placeholder and a file overlay-compressed with
-LZX are refused the same way, for the reasons under
-[What a file stores](#what-a-file-stores-cloud-placeholders-and-overlay-compression).
-Only the unnamed stream is the file's content; the named ones are read separately, as
-[Alternate data streams](#alternate-data-streams) describes. `NtfsWalker.stamps(record)` returns
-the created, modified and accessed instants a file's `$STANDARD_INFORMATION` holds;
-`entry()` carries only the modified one, which is what a listing needs.
-
-Deleted files are recovered separately, from the MFT rather than the directory index.
-`NtfsWalker.deleted_files()` yields every record that is marked free but still names a
-file: its name, size, dates, and whether the content can still be read. A file whose
-data was **resident**, small enough to sit inside the MFT record, is always recoverable
-this way, and it is the only route to one, because it never occupied a cluster a carver
-could find. A non-resident file is recoverable only while every cluster it used is still
-free; once a later file has taken one, `read_deleted()` refuses it rather than hand back
-bytes that now belong to something else, so overwritten data is never presented as the
-file. `$ATTRIBUTE_LIST` is not followed for a deleted record, because it points at other
-records that may since have been reused, so a file whose attributes overflowed its record
-is reported as having existed rather than reconstructed from whatever now lives there.
-
-Validated two ways. A 16 MiB volume written by `mkntfs` and populated through `ntfs-3g`
-carries a resident file, an empty one, a sparse one, a compressed one, one fragmented
-across 333 runs whose attributes had to move into other records, a file grown past what
-was written into it, one record with 61 names, a directory of 400 entries so the index
-outgrows its record, a name that needs UTF-16, an alternate data stream, and a resident
-and a non-resident file that were created and then deleted; every one of its 475 live
-files comes back byte for byte against hashes an independent reader recorded from the
-same image, the two deleted files are recovered from the MFT and match the bytes written
-before they were deleted (which The Sleuth Kit's `icat` confirms from the same records),
-and that fixture ships with the tool so the self-test compares against it. On real evidence, a 231.9 GiB Windows volume inside a 232.9 GiB FTK Imager
-acquisition: 221,851 live regular files in 9 seconds, the same set The Sleuth Kit's
-`fls` reports, each resolving to the same MFT record, and 1,339 of 1,341 sampled files
-byte-identical to `icat`. The two that differ are metadata files whose content lives
-only in named streams, where the two tools pick different streams.
-
-On a second real image, a small NTFS volume with a screen recording deleted from it,
-`deleted_files()` finds the one deleted record `fls -d` reports and recovers its 5.8 MB
-byte-identical to `icat`.
-
-`tools/make_ntfs_fixture.sh` rebuilds the fixture on any Linux box with
-`ntfsprogs` and `ntfs-3g`, as an ordinary user, and refuses to finish if the image it
-wrote does not read back as what it meant to write. It creates the two deleted files
-last, so nothing reuses their records or clusters, and records their hashes before
-removing them.
-
-That comparison earned its cost twice: it found this reader returning stale bytes past
-a file's initialized size, and a second pass found the run list of a heavily fragmented
-file counted twice because its own record is named in its attribute list.
-
-### Alternate data streams
-
-Since 1.37. A file on NTFS can carry named streams beside its content, and some of what an
-examiner wants most lives in one: `Zone.Identifier`, the Mark of the Web, says where a
-download came from; `$Extend/$UsnJrnl:$J` is the change journal, a record of files created,
-renamed and deleted; `$Secure:$SDS` holds the volume's security descriptors. The metadata
-files whose content is in their unnamed stream (`$MFT`, `$LogFile`, `$Boot` and the rest)
-were always listed and read like any file. `$UsnJrnl` and `$Secure`, whose content is only
-in named streams, were listed as empty files, and nothing read a stream.
-
-Each stream has a node of its own, an `NtfsStreamRef` of the record and the stream's name,
-and `read_file()`, `entry()` and `stamps()` take it. So a caller that lists entries and
-hands each node back to read it, as the LEAPP tools' raw image reader does, reads a stream
-with no new call:
-
-```python
-for path, node, mode, size, mtime, recorded in walker.listing(streams=True):
-    if isinstance(node, q.NtfsStreamRef):          # "Downloads/setup.exe:Zone.Identifier"
-        data = b"".join(walker.read_file(node, size))
-```
-
-Streams are listed only when asked for. `listing()`, `walk_all()`, `collect()`, `--extract`
-and the window's Contents pane are as they were, because a caller that asked for a folder's
-files and was handed `report.lnk:Zone.Identifier` among them would pass it to a parser
-expecting a shortcut. `listing(streams=True)` names each stream `path:stream`, as Windows
-does, straight after its file, with the file's modified time (NTFS keeps no dates per
-stream); a stream on the root directory is `:stream`. A caller walking the tree instead asks
-`streams(record)` for each entry. `--list` names every stream beside its file at its
-recorded size, as it did, and now once each: before 1.37 a stream whose run list had
-outgrown its record, which `$J` on a volume of any age has, was printed once per record,
-all but the first at 0 B.
-
-Two rules about holes decide what a stream is read as, and both come from metadata files
-whose recorded size is not what they hold:
-
-- **A hole at the front of a stream is not read.** Windows frees the front of `$J` as the
-  journal grows and leaves a hole there, so its recorded size runs to gigabytes and all but
-  its last few megabytes read as zeros. A stream is read from its first stored cluster
-  instead, and its listed size is what that read returns. A USN journal parser loses
-  nothing, because every record carries its own offset in the stream as its USN, and
-  `front_hole(node)` gives the bytes skipped for anything else that needs the offset.
-- **A stream that is all hole is not listed.** `$BadClus:$Bad` is recorded as the size of
-  the whole volume and a healthy disk stores none of it. A stream of no bytes is listed,
-  since it was created empty and its being there can be the evidence.
-
-A hole after the first stored cluster is content and reads as zeros, as in a file.
-
-Validated against a second NTFS fixture, `tests/fixtures/ntfs-streams.img.gz`, written by
-`mkntfs` and `ntfs-3g` with a stream of every shape above: two `Zone.Identifier` streams, a
-`$J` with a 1 MiB hole at its front and 1.8 MB of records scattered over 365 runs whose
-run list overflows into a second MFT record, a `$Max` beside it, a stream sized and never written,
-one with a hole in the middle, an empty one, one on a directory and one on the root, two
-compressed ones (one after a hole), one on a file with two names, twelve on one file so
-that five move to other records, and one whose name needs UTF-16. The self-test lists all
-28 that store anything, and each matches the bytes The Sleuth Kit's `icat` reads from the
-same stream, from the first stored cluster that `istat` names. `$BadClus:$Bad` and the
-stream sized and never written are the two left out. The same check turns red when the
-front hole is read, when a stream that stores nothing is listed, and under each of nine
-further changes that break a rule here, one at a time.
-
-`tools/make_ntfs_streams_fixture.sh` rebuilds that fixture on Linux, and refuses to finish
-unless what it wrote, what `ntfs-3g` reads back, and what `fls`, `istat` and `icat` find all
-agree. No Windows-written change journal is in it, because `ntfs-3g` does not keep one.
-
-On a 1,006 MiB volume Windows wrote, `ntfs-cloud.bin.gz` in the dissect.ntfs test data (at
-fox-it/dissect.ntfs `7f021dd1182eb6f9b6a2dbd19cf2e29143ea654d`, not committed here), all
-seven streams that store anything are listed, `$Extend/$UsnJrnl:$J` (21,376 bytes),
-`$UsnJrnl:$Max`, `$Secure:$SDS`, `$UpCase:$Info`, `$RmMetadata/$Repair:$Config`,
-`$TxfLog/$Tops:$T` and a stream the OneDrive client left on its folder, and each is
-byte-identical to `icat`'s reading; `$BadClus:$Bad` is left out. That journal is young
-enough to have no hole at its front, so the front-hole rule is still checked against the
-fixture's shape only.
-
-### What a file stores, cloud placeholders and overlay compression
-
-Since 1.56. The size a file records and the bytes a volume holds for it are different
-numbers for a sparse file, a compressed file and a cloud provider's placeholder, and
-`read_file()` hands back the recorded size in every case it reads, holes as zeros. A tool
-that copies files out of an image therefore writes more than the image holds, and until
-1.56 it also wrote two kinds of file that were not there at all:
-
-- **A cloud placeholder.** OneDrive with Files On-Demand, and any other sync engine built
-  on the Windows Cloud Files API, leaves a file kept online-only as a record with its full
-  size, a cloud reparse tag, and an unnamed stream in which every cluster is a hole. Read
-  as a file, it is its size in zeros. Windows itself will not read one with no provider
-  running ("The cloud file provider is not running"), and since 1.56 neither does this:
-  `read_file()` raises `NtfsUnreadable` naming the tag, the recorded size and what is
-  stored, so an extraction lists the file as not read instead of writing zeros under its
-  name. A cloud file that is all there (a hydrated placeholder) keeps its tag and reads
-  normally.
-- **An overlay-compressed file.** `compact /exe` compresses a file through the Windows
-  Overlay Filter, and Store app packages, .NET native images and Defender's platform
-  files were found compressed that way on the images below. The filter keeps the
-  same all-hole unnamed stream and puts the real content, compressed, in a stream named
-  `WofCompressedData`. Until 1.56 such a file read as zeros of the right length. It is now
-  decoded: XPRESS in 4K, 8K and 16K chunks. LZX (`compact /exe:lzx`) is not decoded and
-  is refused by name, as is a file of 4 GiB or more and one backed by WIMBoot, whose
-  content is in a WIM file elsewhere.
-
-`allocation(walker, node)` says what a volume stores for one file: `size` (what
-`read_file()` returns), `stored` (the bytes held for the content, in whole clusters, or the
-length of a resident one), `sparse`, `compression` (`lznt1`, `wof-xpress8k` and so on, or
-`decmpfs` on APFS) and `placeholder`. On NTFS it adds `reparse_tag` and `attributes`, on
-APFS `bsd_flags`. A walker that cannot say answers `None`. Total `stored` over the files
-you are about to copy to know what they occupy; total `size` to know what you will write.
-
-On APFS the stored figure is the data stream's `alloced_size` less the inode's
-sparse-bytes field. `alloced_size` alone is the logical size for a sparse file, holes
-included. Measured on a volume macOS 27 wrote: the difference equals the blocks `stat`
-reports on five of five sparse files (a 100 MB file storing 32 KB among them), and the
-figure equals `stat` on the three ordinary files beside them. `placeholder` on APFS is the
-`SF_DATALESS` flag (iCloud Drive with optimised storage sets it). That is taken from
-`sys/stat.h` and is not exercised: no image holding a dataless file has been read.
-
-Validated against a volume Windows 11 (build 26200) wrote,
-`tests/fixtures/ntfs-windows.img.gz`, built by `tools/make_ntfs_windows_fixture.cmd`:
-five files compressed with each of `compact /exe:xpress4k`, `xpress8k`, `xpress16k` and
-`lzx` (text, text of exactly 32,768 bytes, a 5,000 byte file, text around 20,000 random
-bytes, and zeros around text; 7 of the 161 XPRESS chunks are stored plain), two NTFS
-compressed files, five sparse files, a plain file, a resident file, a file with two names, three
-online-only placeholders the Cloud Files filter wrote through `CfCreatePlaceholders`, and
-one cloud file converted in place and left whole. The manifest beside it holds what
-Windows said about each: its length, its size on disk, its SHA-256, and whether Windows
-could read it. The self-test requires all 27 files Windows hashed to read to the same
-hash, the three Windows refused to be refused and to be the only placeholders, the five
-LZX files to be refused by name, and `stored` to equal Windows's size on disk on all 25
-sparse and compressed files whose content lies in clusters. Then it switches each rule
-off in turn and requires the comparison to fail: reading the unnamed stream of an
-overlay-compressed file, reading a placeholder's hole, and taking every XPRESS file to be
-in 4 KiB chunks. The algorithm numbers in the reparse point (0 XPRESS4K, 1 LZX,
-2 XPRESS8K, 3 XPRESS16K) are what that volume holds for each.
-
-On real evidence: two public Windows 10 acquisitions hold 1,873 overlay-compressed files
-between them, all XPRESS8K, and all decode to their recorded length. 843 of them are
-executables carrying an Authenticode signature, and the digest computed from the decoded
-bytes is in the signature on every one. 43 more match the checksum in their PE header.
-27 differ from that checksum and carry nothing else to check them against; 34 of the 843
-differ from it the same way and are proven by their signatures, so a stale header
-checksum is something those files have. A public Windows 11 acquisition holds four LZX
-files, which are refused, and one OneDrive file kept online-only: 1,151,898 bytes
-recorded, none stored, reparse tag `0x9000401A`, the attributes `SPARSE_FILE`,
-`REPARSE_POINT`, `OFFLINE` and `RECALL_ON_DATA_ACCESS`, the tag and the four attributes
-the fixture's placeholders carry. It read as 1,151,898 zero bytes before 1.56 and is
-refused now.
-
-Not exercised: a cloud file held in part, some ranges present and some with the
-provider. It is refused on its `RECALL_ON_DATA_ACCESS` attribute, because its holes are
-missing data and not zeros, and no image holding one was found; Windows would not make
-one without a provider running (`CfDehydratePlaceholder` answered `0x8007016A`).
-
-### NTFS compression units that stop early
-
-Since 1.57. An NTFS-compressed file is stored in units of 16 clusters, and a compressed
-unit is a series of LZNT1 chunks of up to 4,096 bytes of output each. A unit does not
-have to be full. A chunk header of zero ends it, and the rest of the unit is zeros.
-Until 1.57 `read_file()` returned only what had been decoded up to that point, so the
-file came back shorter than its recorded size with nothing said, and any unit after the
-short one was returned at the wrong offset.
-
-This is how ntfs-3g reads one: a zero header ends the unit
-([compress.c lines 506 to 507](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L506-L507))
-and what is left of it is filled with zeros
-([lines 683 to 685](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L683-L685)), as is a
-compressed chunk that inflates to fewer than 4,096 bytes
-([lines 668 to 676](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L668-L676)). A chunk
-that runs past the unit's stored bytes, a stored chunk that is not 4,096 bytes long and
-a back reference to before its own chunk are refused there
-([lines 522 to 523](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L522-L523),
-[531 to 533](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L531-L533),
-[626 to 627](https://github.com/tuxera/ntfs-3g/blob/7f0f841fc52cf719106c5c93bafe465004e36816/libntfs-3g/compress.c#L626-L627)), and here
-`read_file()` raises `NtfsUnreadable` for them. Until 1.57 those three also ended the
-unit quietly.
-
-Measured on four public Windows acquisitions (three of Windows 10, one of Windows 11):
-846 NTFS-compressed files, 17,442 compressed units. 17,440 decode to a full unit and
-are byte for byte what 1.56 returned. Two stop at a zero header, one on each of two
-images, both in a OneDrive sync engine log (`SyncEngine-*.aodl`):
-
-| recorded size | stored | 1.56 returned | 1.57 returns |
-| ---: | ---: | ---: | ---: |
-| 129,947 | 73,728 | 65,536 | 129,947, the second unit as zeros |
-| 61,521 | 20,480 | 0 | 61,521, all zeros |
-
-The Sleuth Kit 4.15.0 (`icat`) returns the same bytes as 1.57 for both, by SHA-256. In
-the second file the unit's five stored clusters are not empty: the first two are zeros
-and the other three hold 11,223 non-zero bytes. By the rule above those bytes are not the
-file's content, and neither reader returns them. They are on the volume, in the clusters
-`allocation()` counts as `stored`. None of the 17,442 units met any of the three
-refusals.
-
-The self-test changes one unit of the Windows-written fixture's `lznt1/text_100000.txt`
-in three copies of the volume: the second unit's first header set to zero, the first
-unit's first header set to zero, and a second unit that opens with a back reference. The
-first two have to read to the SHA-256 `icat` gave for the same changed volumes, which is
-also what the file's own bytes give with that unit replaced by zeros. The third has to
-be refused, and `icat` stops with an error at that unit. Then it runs the first two with
-a decoder that ends the unit at the zero header and requires both to fail.
-
-Not changed: the initialized size of a compressed stream is not applied, as it is for a
-stream that is not compressed. One of the 846 files has one below its size (8,192 of
-8,448 bytes), and the bytes past it decode to zeros anyway.
-
-### FAT32 and exFAT times are readings, and are listed as such
-
-A FAT32 or exFAT file's times are a wall clock the volume stored with no zone
-(exFAT stores a UTC offset beside each one, which is shown and not applied), so a
-walker for either gives `entry()` an mtime of 0 and hands the readings out through
-`listdir_records()` instead. `--list` prints them that way, `modified 2023-06-01
-12:00:00 (as stored, no zone)`, never as an instant and never as `1970-01-01`,
-and the window's Contents pane puts them in a **Recorded (as stored)** column with
-the three (UTC) columns left blank.
-
-### Deleted files on FAT32 and exFAT
-
-FAT32 and exFAT recover deleted files too, through `Fat32Walker.deleted_files()` and
-`ExfatWalker.deleted_files()` with the same `read_deleted()` reader. A FAT32 delete
-writes `0xE5` over the first byte of the directory entry and frees its clusters in the
-FAT; an exFAT delete clears the in-use bit of the entry's type byte and the file's bits
-in the Allocation Bitmap. Either way the name, first cluster, size and recorded dates
-survive, so a deleted file comes back with all of them.
-
-What neither keeps is where a fragmented file's later clusters lay: FAT32 zeroes the
-chain on delete, and exFAT keeps a chain only for a file it wrote fragmented in the
-first place. So a file that occupied one run is recovered exactly, and one whose size
-would need clusters that a later file has since taken is reported as having existed
-rather than read, because reading it would splice in bytes that now belong to something
-else. A recovered file says in `assumed_contiguous` whether its layout was taken on the
-one-run assumption or from a chain the volume still held. A deleted directory whose
-first cluster is still free and still parses as a directory is walked into, so a folder
-of photographs deleted whole comes back file by file.
-
-Validated the same way as NTFS. `tools/make_fat_deleted_fixtures.sh` builds a FAT32 and
-an exFAT image, each with a folder of two photographs and one fragmented photograph,
-created and then deleted; the self-test recovers them from the directory entries and
-matches the hashes taken before deletion, and The Sleuth Kit's `icat` recovers the same
-bytes from the same entries. The fragmented file that lands across reused space is
-refused by this reader and is the one case `icat` will read on the contiguous
-assumption; refusing it is the deliberate choice not to present bytes the entry cannot
-vouch for.
-
-## BitLocker
-
-Since 1.43 a BitLocker volume is recognised by its own header and, given a key, read
-decrypted in place, so the filesystem inside it (NTFS, FAT32 or exFAT) is listed and
-extracted like any other. Before 1.43 its header, which is a FAT32 boot sector in all but
-BitLocker's own signature and identifier, was taken for an empty FAT32 volume.
-
-Without a key the volume is listed as `bitlocker` and not walked. The report gives what
-the volume records about itself: the encryption method, its description (the computer
-name, drive label and date Windows wrote when it was encrypted, as stored), when it was
-created, its volume id, and each key protector with its id. The note says what would
-open it, naming the recovery password's protector id, which is the id to quote when
-asking for the recovery key from wherever it was escrowed.
-
-A key is one of:
-
-- its password or recovery password, with `--password-file FILE` or `--password-env NAME`,
-  the options an encrypted image takes (each one given is tried as both);
-- its startup key, a `.BEK` file, with `--bitlocker-key FILE`;
-- nothing, when protection is suspended: the volume then keeps its key in the clear, and
-  the report says `suspended`.
-
-A volume whose only protector is its TPM cannot be read from an image, because the TPM's
-key never leaves the device; a recovery password set on the same volume still opens it.
-The window asks for a password or recovery password for each locked volume when it
-loads an image, and takes a `.BEK` file when the answer is left empty.
-
-From Python:
-
-```python
-image = q.open_image(path)
-image, found = q.unlock_bitlocker(image, passwords=[recovery_password], key_files=["key.BEK"])
-for vol in q.volumes(image):
-    print(vol["kind"], vol.get("encryption", ""), vol.get("note", ""))
-```
-
-`unlock_bitlocker()` returns the image with every volume it opened decrypted in place,
-so `read_at()` at that volume's own offsets returns plaintext and every walker, free
-space report and extraction sees the decrypted volume; it also returns one `BitLocker`
-per volume found, opened or not, whose `lines()` is what the report prints. A volume it
-opened carries `encryption` in `volumes()` (`BitLocker AES-128-XTS, unlocked with its
-recovery password`), and a locked one carries `BitLocker, locked` and the note.
-
-**What is read**: AES-128 and AES-256 in CBC and XTS modes, the layout Windows 7 and later
-write, and a volume whose conversion was paused while encrypting or decrypting. Such a
-volume carries an Encrypt-on-Write map saying which ranges are not yet encrypted, and
-those are read as stored. **What is not**: the Elephant diffuser (Windows Vista and 7), the
-Windows Vista layout, and a TPM; each is named in the note. The BitLocker To Go layout
-for FAT volumes (Windows 7's discovery volume on removable drives) is read the same way,
-but no sample of it exists here, so it is tested only on constructed volumes.
-
-A volume encrypted with "used space only" encrypted only the space holding data at the
-time, and its free space is not wiped
-([Microsoft, BitLocker configuration](https://learn.microsoft.com/en-us/windows/security/operating-system-security/data-protection/bitlocker/configure)).
-Space that was free then and not written since can still hold earlier data in the clear,
-and reading it through the key turns that into noise. If deleted files from before
-encryption matter, carve the partition as stored as well as decrypted.
-
-Decryption is pure Python over the `pycryptodome` package the release executables carry:
-on an Apple M2 Max, about 80 MB/s for XTS and 120 MB/s for CBC.
-
-Checked against 13 volumes Windows 11 Pro (build 26200) wrote: NTFS with each of the four
-methods, FAT32 and exFAT, a suspended volume, two fully encrypted ones, and four whose
-conversion was paused (encrypting used space only at 93.8%, and three paused early:
-encrypting at 45.6%, encrypting used space only at 58.6%, decrypting with 63.8% still
-encrypted). On every one, every file written before encryption hashed as Windows
-recorded, each opened with each of its keys given alone (the suspended one with the
-clear key, which is tried first), and the protector ids equal those Windows reports
-(less the clear key of the suspended volume, which Windows does not list as a
-protector). With the Encrypt-on-Write map ignored, the three early ones lost 8 and 9 of
-their 25 files, and the one being decrypted was not recognised as NTFS at all. Those
-volumes are kept outside this repository; `tools/make_bitlocker_fixtures.py` builds the
-small ones the self-test reads.
-
-## F2FS
-
-F2FS is the filesystem Android uses for `/data` on most phones, so an Android
-image or a bare `userdata` partition can carry one where an older device would have
-ext4. `--list` and `--extract` read it directly. The volume is claimed by its 4-byte
-magic 1024 bytes in, together with the reserved inode numbers the format fixes (node 1,
-meta 2, root 3) and a block size and segment size it allows, rather than by the magic
-alone.
-
-What it reads: files stored inline in the inode, files addressed by the inode's own
-pointer list, and larger files reached through direct, single- and double-indirect node
-blocks; directories in both the inline and the multi-block form; and symbolic links.
-Timestamps are real UTC instants, so a `--list` shows Modified and, in the window,
-Created and Accessed. To find a file the reader resolves each node id through the Node
-Address Table, choosing the current copy of each NAT block from the active checkpoint's
-bitmap and applying any override in the checkpoint's NAT journal, exactly as the kernel
-does.
-
-What it does not do: a file with per-file encryption (the norm on a real Android
-`/data`) is listed and its content refused, since the volume holds no key, and its name
-is shown as stored; a compressed file (LZ4/LZO/zstd clusters) is listed with its
-recorded size and not decompressed. See [What it does not do](#what-it-does-not-do).
-
-Validated against two independent readers. On a fixture `mkfs.f2fs` and `sload.f2fs` wrote
-(`tools/make_f2fs_fixture.sh`), every file inside the inode matches what `sha256sum`
-recorded over the source tree, and the one file large enough to reach direct and
-single-indirect node blocks matches what f2fs-tools' own `dump.f2fs` extracts. On a second
-fixture the Linux kernel driver itself wrote by mounting a volume and writing sparse files
-(`tools/make_f2fs_hole_fixture.sh`), files full of holes read back the same bytes the
-kernel read, holes as zeros. That kernel-written image also carries seven NAT-journal
-entries in the compact summary form, every one of them overriding an on-disk NAT entry
-that reads unallocated, so the journal path is not just exercised but load-bearing there:
-without it no file on that volume resolves. The journal in the normal (non-compact)
-summary form is read by the same rules and is not exercised by either fixture. No real
-F2FS volume is in the test corpus yet, and the double-indirect path (reached only past
-about 8 GiB in one file) is not exercised at all.
-
-A defect in 1.28 is worth knowing about: the bitmap that says which copy of each NAT
-block is current was read with bit 0 as the least significant bit of a byte, but F2FS's
-own `f2fs_test_bit` puts bit 0 at the most significant end. Every fixture then had that
-bitmap all zero, so the two orders agreed and nothing showed it. A third fixture
-(`tools/make_f2fs_free_fixture.sh`, root required) has the kernel write the volume in two
-mount sessions, which rewrites NAT block 0 and sets the bitmap's first bit. Measured on
-it: 1.28 finds no files at all, and the kernel reads 44; 1.29 reads the same 44 byte for
-byte. So the failure of the old order is an empty walk that looks like an empty volume.
-Fixed in 1.29, where the SIT version bitmap is read the same way, and that fixture's
-self-test leg refuses to pass unless the bitmap really does carry a set bit.
-
-The same fixture deletes a 1 MiB file, each of whose 256 blocks names its own index,
-before the second checkpoint, on a `nodiscard` mount so the loop device does not zero
-what it frees. All 256 blocks are still in the image and all 256 lie inside the runs
-`free_extents()` reports, which is the property a carve scoped to free space depends on.
-Both kernel-written fixtures also carry six SIT-journal entries that differ from the
-on-disk table, so that override is load-bearing for the free-space answer too.
-
-Since 1.29 `F2fsWalker.free_extents()` reports the space the volume says is free, from the
-segment information table: one validity bit per block of the main area, 512 per segment,
-set by the filesystem's own `f2fs_set_bit` (bit 0 at the top of the byte, the same trap as
-above), the current copy of each SIT block chosen by the checkpoint's SIT version bitmap
-and any entry in the cold-data summary journal overriding the table. Only the main area is
-reported; the superblock, checkpoint, SIT, NAT and SSA areas are the filesystem's own. The
-self-test holds it against the checkpoint's own `valid_block_count` and against position:
-on both committed images the blocks live files and their nodes occupy equal that count
-exactly, none of them lies in a reported run, and the runs plus those blocks tile the main
-area. Read least-significant-first, the same map put 14 live blocks of one image inside
-"free" runs while the total still matched, which is why the check is positional.
-
-## Linux flash filesystems
-
-Since 1.31. Embedded Linux keeps its filesystems on flash, and four formats cover most
-of what turns up: SquashFS for a read-only system image, JFFS2 on NOR flash, UBI with UBIFS on NAND,
-and YAFFS on older NAND. `--list` and `--extract` read all four, on their own or inside a
-raw flash dump (see [Raw flash dumps and NAND spare bytes](#raw-flash-dumps-and-nand-spare-bytes)).
-Each reader follows the kernel code (for YAFFS, Aleph One's own code) that reads the
-format, cited line by line in the source and under
-[Where the constants come from](#where-the-constants-come-from).
-
-The fixtures come in two kinds. Most were written by the format's own tools
-(squashfs-tools 4.7.5, mtd-utils 2.3.0, and Aleph One's yaffs2 built from source) from a
-source tree chosen for its shapes, and each reader is held against oracles it never
-touches: `sha256sum` over the source tree for the content of every file, and the tree's
-own `stat` listing (for SquashFS, `unsquashfs -lln`) for the type, permissions, size and
-modification time of every entry. Those tools write an image in one pass, so they leave no
-history. The others carry history: the Linux kernel's own JFFS2, UBI and UBIFS drivers
-(kernel 7.0.0), and YAFFS's own code, wrote them through a series of overwrites, deletions
-and renames, and read them back, and that reading is the oracle. The scripts that build
-them all are in `tools/`. Two of the readers have since been run against flash from a real
-device as well: YAFFS2 against an Android phone and UBIFS against a camera, both below.
-SquashFS and JFFS2 have not; see [What it does not do](#what-it-does-not-do).
-
-### SquashFS
-
-A read-only, compressed filesystem, and the usual root filesystem of a router or a camera.
-Version 4.0 is read. The 1.x to 3.x layouts, and their big-endian `sqsh` form, are
-recognised and reported but not walked. A volume is claimed only when its superblock
-passes the checks the kernel makes before it mounts one (a block size that agrees with its
-own log, a compression id the format defines) and its root inode reads back as a
-directory.
-
-Every compressor mksquashfs offers is read: gzip, xz (including a BCJ filter), the legacy
-lzma format, LZO, LZ4 and, on Python 3.14 or later, zstd. Files split into blocks, files
-that end in a shared fragment, and holes are read; symlinks, hard links, device nodes and
-FIFOs are listed. Extended attributes are not reported.
-
-Validated on eight images, one per compressor plus an uncompressed one and one with 4 KiB
-blocks: 612 of 612 files match `sha256sum` over the source tree, and 621 of 621 entries
-agree with `unsquashfs -lln` on every image. The tree includes random bytes that the
-4 KiB-block image stores uncompressed because they did not shrink, a file shaped to reach
-an LZ decoder's rarer instructions, a directory of 600 entries (more than one directory
-header and metadata block) and a 255-byte name.
-
-### JFFS2
-
-A log-structured filesystem with no superblock: the filesystem is whatever nodes the
-region holds. It is claimed when the region's first bytes that are not erased flash
-(0xFF) open a node whose header CRC holds, and a scan of the region finds inode or
-directory nodes. Both byte orders are read.
-
-Every node is scanned and its header CRC checked. A node the filesystem has marked
-obsolete is ignored, and so is one whose data fails its own CRC, as the kernel's
-`check_node_data` does, so an older copy of that data shows through where one exists; the
-report counts the nodes dropped, and a name whose inode is left with no readable node is
-not listed, and counted too. For
-each name the newest version wins and a newer entry with inode 0 unlinks it; each file
-takes its mode, owner and times from its newest inode node and is cut to that node's size.
-The none, zero, rtime, zlib and LZO compressors are read, and so is LZMA (compression
-8), which mainline Linux does not have and OpenWrt adds: a raw LZMA stream with its
-properties fixed in the code rather than stored (lc 0, lp 0, pb 0, an 8 KiB dictionary),
-decoded to exactly the size the node records. Rubin, dynrubin and copy are reported and
-not read. Erase block summary nodes are stepped over.
-
-Validated on seven images from `mkfs.jffs2` (both byte orders, zlib, LZO, rtime, none, one
-run through `sumtool`, and one written by OpenWrt's LZMA-patched `mkfs.jffs2`, which
-`tools/make_jffs2_lzma_fixture.sh` builds from pinned sources): 310 of 310 files and 317
-of 317 entries match, and the two
-device nodes carry the type and permissions the device table gave them. (`mkfs.jffs2`
-stamps device nodes, and so `/dev`, with the time it ran, so their times are not compared.)
-
-`mkfs.jffs2` writes each node once, so those images carry no history. Two more do, written
-by the Linux kernel's JFFS2 driver through the history described under
-[Kernel-written history](#kernel-written-history) below: one on NOR flash, where the kernel
-marks each node it supersedes obsolete (154 on the committed image), and one on NAND
-taken with `nanddump --oob`, where it cannot, so older nodes stay valid and only their
-version numbers say which is current (24 directory entry nodes for 13 linked names, none
-marked). The self-test prints these counts and fails if the history is gone.
-Both match what the kernel reads back from them, 10 of 10 files and 13 of 13 entries.
-
-### UBI and UBIFS
-
-UBI is the volume layer raw NAND runs under: each eraseblock carries an erase counter
-header, and a mapped one a second header naming the volume and logical block it holds.
-The reader finds the eraseblock size from the distance between those headers, rebuilds
-each volume from its blocks (of two copies of one block the higher sequence number wins,
-unless it is a copy whose data CRC fails; a block with one copy is used as it is, as the
-kernel attaches it), and reads the volume table. A volume holding
-UBIFS or SquashFS is listed as a folder named after the volume; any other volume, a kernel
-image for example, as a single file holding its bytes. UBI records no time for a volume,
-so none is shown for such a file.
-
-UBIFS is read from its committed index, found through the master node, and then the
-journal written since the last commit is replayed over it the way the kernel's
-`replay.c` does: newer inode and data nodes in sequence order, an inode whose link count
-reaches zero removed, a directory entry with inode 0 removing its name, and a truncation
-dropping the blocks past the new size. LZO, zlib (raw deflate, as the kernel writes it),
-uncompressed data and, on Python 3.14 or later, zstd are read, and a block the index does
-not hold is a hole. A bare UBIFS image, as `mkfs.ubifs` writes it before `ubinize` wraps
-it, is read too.
-
-A raw NAND dump holds the bits as the cells gave them, before the controller's error
-correction fixed them, so a node the device read cleanly can fail its CRC in the dump by
-one flipped bit. When one bit accounts for the difference, qnxprobe restores it and reads
-the node, as the controller would have, and the report counts every node read that way:
-
-```
-        bit errors   4 node(s) failed their CRC by one flipped bit and were read with that bit restored, as the NAND controller's ECC would have done
-```
-
-CRC-32 gives every single bit of a message this size a different CRC change, so at most
-one bit fits, and its shortest weight-3 codeword is 91,640 bits, so on a node of up to
-11,450 bytes two flipped bits are never taken for one (the self-test finds that codeword).
-A node off by more than one bit is not read, and the file says why: its CRC fails by more
-than one bit, or its place reads as erased flash, so no copy of it is in the image.
-
-Validated on a bare `mkfs.ubifs` image and on five `ubinize` images (NAND with LZO, zlib,
-zstd and no compression, and NOR), each with three volumes: the UBIFS volume matches 410 of
-410 files and 416 of 416 entries, a static volume holding SquashFS matches 6 of 6 files,
-and a static raw volume spanning two eraseblocks matches its hash. `mkfs.ubifs` commits
-everything to the index and `ubinize` writes each block once, so in those images the
-journal is empty and no block has a second copy.
-
-A third image carries both. The Linux kernel's UBI and UBIFS drivers wrote it on simulated
-NAND through the history described below, and it was taken with `nanddump --oob` while
-UBIFS was still mounted, so the journal nodes written since the last commit (269 on the
-committed image) have to be replayed over the index. Among them are a truncation, deletions, renames and a file created
-with no name (`O_TMPFILE`), written, given an extended attribute and then linked in, which
-leaves an inode record with no links after the file's data. Its static volume was written
-twice, and the first version's two eraseblocks were put back into free eraseblocks from a
-dump taken between the writes, the state a power cut during the rewrite leaves, so each of
-its blocks has an older copy on the flash. The UBIFS volume matches what the kernel reads
-back, 11 of 11 files and 14 of 14 entries, and the static volume the kernel's choice of its
-second version. The report names the older copies:
-
-```
-        note         2 eraseblock(s): an older copy of a block, not the one read
-```
-
-### YAFFS1 and YAFFS2
-
-NAND filesystems with no superblock: every page carries its tags in its spare bytes, and
-the filesystem is rebuilt from the tags. The page size, spare size and where in the spare
-the tags sit are recorded nowhere, and differ with the NAND controller, so they are found
-by trying eleven common page and spare sizes (512+16 to 16384+1280) and, for YAFFS2,
-every tag offset in the spare and both byte orders. A layout is accepted only when at least 90% of the used
-spares hold plausible tags and at least 90% of the pages those tags call object headers
-parse as object headers. The first 256 pages are tried first. YAFFS writes wherever
-garbage collection freed a block, so a partition can open on blocks holding only data
-pages or only erased ones; when the first pages hold tags that fit but no object header,
-or almost nothing but erased pages, the same test runs again over sixteen stretches spread
-across the whole region, each the same number of bytes for every page size tried.
-
-YAFFS2 is read the way its own scan reads it: blocks newest first, the newest object
-header and the newest copy of each data page winning, data past a shrink or past the
-newest header's size ignored, and a file's size taken from its newest header or from data
-written after it, whichever is further. YAFFS1 orders two copies of a page by their 2-bit
-serial number and takes a file's size from where its furthest live page ends. `lost+found`
-is always listed, as YAFFS lists it; when the flash holds no header for it or for the root,
-no time is shown for them, since YAFFS makes them at mount time.
-
-Validated two ways. Aleph One's own image makers wrote four images (YAFFS2 little endian,
-YAFFS2 with big-endian headers, YAFFS2 with its tags two bytes into the spare, and YAFFS1):
-158 of 158 files and 164 of 164 entries match on each. And YAFFS's own code, run in user
-space over a file standing in for NAND (`tools/yaffs_history.c`), wrote three images with
-history: overwrites, a shrink and a regrow, holes, deletion, a rename, a hard link whose
-first name was removed, enough churn for garbage collection to run, and a file flushed and
-never closed, with no unmount at the end. The YAFFS1 images end in power cuts, one of them
-leaving two live copies of a page with different bytes that only their serial numbers
-order. The oracle for those is YAFFS's own code mounting a copy read-only and reading every
-file back: 48 of 48, 49 of 49 and 2 of 2 files match, and every entry agrees.
-
-A real device dump confirms it: Case 2 of the DFRWS 2011 Forensics Challenge, the flash of
-an Android phone taken with `nanddump`, spare bytes included (2048-byte pages, 64-byte
-spare, tags two bytes in). Its /system, /data and /cache partitions were read by qnxprobe
-and by YAFFS's own code (the same core, pinned at the same commit, reading the dump
-read-only with its tags two bytes into the spare). Both list the same 661, 2,422 and 22
-entries, and all 565, 1,876 and 20 files have the same bytes. Modes and times agree on
-every entry but three: the time of `lost+found` on /system, which the flash does not hold,
-and a socket and a FIFO on /data, whose stored modes carry their type, which qnxprobe
-reports and YAFFS's direct interface drops. Directory sizes were not compared (YAFFS
-reports 2048, qnxprobe 0). The /cache partition's first object header is at page 3,968,
-which is what the wider search above is for; before 1.35 it was not recognised.
-
-### Deleted files on YAFFS2, JFFS2 and UBIFS
-
-None of these filesystems rewrites anything in place. A change goes to a new page or node,
-and the old one stays on the flash until garbage collection erases its block, so a deleted
-file's last name, size and content often outlive the deletion. `recover_deleted()` on a
-YAFFS2, JFFS2, UBIFS or UBI walker yields a `FlashDeletedFile` for each one, and
-`read_deleted()` reads it:
-
-```python
-kind = qnxprobe.identify_fs(fh, 0, size)[0]           # "yaffs2", "jffs2", "ubi", ...
-w = qnxprobe.walker_for(kind, fh, 0, size)
-for e in w.recover_deleted():
-    print(e.parent_path, e.name, e.size, e.recoverable, e.reason, e.note)
-    if e.recoverable:
-        data = b"".join(w.read_deleted(e))
-```
-
-The method has its own name rather than `deleted_files()`, because a caller that handles
-`deleted_files()` for NTFS, FAT32 and exFAT reads fields (`record`, `first_cluster`) these
-records do not have.
-
-- **YAFFS2** deletes a file by writing a header that files it under its unlinked or
-  deleted directory. Each object's headers are cut at every such header, so when YAFFS
-  reuses an object id for a later file, the earlier file still comes back. The file is
-  rebuilt from the chunks written before its deletion, through the same rules as the live
-  scan. When YAFFS deletes a file still in its folder, it first resizes it to 0, writing a
-  header there with size 0 (`yaffs_del_file`); that header is taken as the deletion's, and
-  the file is rebuilt as the header before it describes it. A file truncated to 0 just
-  before it was deleted leaves the same header, and the flash cannot tell the two apart, so
-  a file with content recovered that way says so in `note`. YAFFS1 is not recovered: its pages are ordered only by a 2-bit serial number,
-  which cannot say which copy a deleted file last held.
-- **JFFS2** deletes a name with a directory entry pointing at inode 0 and frees the
-  inode's nodes without erasing them. On NOR it clears one bit in each node header (the
-  node's own CRCs were computed with that bit set, so it is set again before they are
-  checked); on NAND it cannot, and the nodes stay valid. A deleted file is rebuilt from all
-  of its nodes, oldest version first, and named from the newest entry that pointed at it.
-  JFFS2 writes holes as nodes too, so a range no node covers is missing, not a hole.
-- **UBIFS** deletes a file with an inode node of link count 0 and an entry pointing at
-  inode 0. Every node carries a sequence number that orders all writes on the volume, so a
-  deleted inode's data and truncation nodes are replayed in that order up to its deletion,
-  as the journal is. Only the LEBs the volume maps now are read, not an older copy of a LEB
-  UBI still holds.
-
-A file is `recoverable` only when every page, byte or block its size needs is still on the
-flash. Otherwise `missing` counts the gap and `read_deleted()` refuses it: an erased block
-and a hole that was never written look the same, and reading the file would put zeros
-where its content was. A file whose name was erased comes back with an empty `name`.
-
-Validated three ways. On the history fixtures above, the files the writers deleted come back
-with the bytes the writers gave them: `deleted.txt` and the last churn file on YAFFS2,
-`gone.txt` and the replaced `target.txt` on JFFS2 NOR, JFFS2 NAND and UBIFS. Files garbage
-collection partly erased are refused (11 on YAFFS2, 3 on NOR, 24 on UBIFS). Seven changes
-that each break one rule all turn the self-test red.
-
-On a real dump, the /data partition of DFRWS 2011 Case 2 (an Android phone, nanddump with
-spare): 1,945 deleted files, 1,924 of them complete, 1,001 of those SQLite `-journal`
-files. YAFFS reuses object ids: id 2539 alone held 114 of those deleted files. As a
-second reader, YAFFS's own core read copies of the dump with everything written from a
-file's deletion onward erased, so that the file was live again. On 150 files sampled at
-random from those with content, 149 match byte for byte: 24 at their path and 125 under
-`lost+found`, where YAFFS files an object whose folder's newer header the rollback erased.
-The one that differs, a 3-byte property file, had its replacement renamed onto its name two
-writes before it was deleted, so the rolled-back path already held the replacement.
-
-On the Foscam R2 camera dump used in the UBIFT case study (DFRWS EU 2024), the root
-volume gives 26 deleted files and the configuration volume 10, all complete, every block
-decompressing to the size its node records. No second reader was run on those.
-
-### Raw flash dumps and NAND spare bytes
-
-A dump read off a flash chip has no partition table (the kernel learns the flash layout
-from the device tree or its command line, which the dump does not carry), and usually a
-bootloader at offset 0. So when an image has no partition table and nothing is recognised
-at its start, qnxprobe looks for SquashFS, UBI and JFFS2 at every 4 KiB boundary of an
-image up to 8 GiB, checks each candidate the way identification does, and reports each one
-it finds as its own volume, under `FLASH` in the report. Since 1.51 the same pass also looks
-for ext2, ext3 and ext4, because an eMMC image from an embedded device can hold its
-partitions with no table the image carries (the kernel can take the layout from its
-command line instead, `blkdevparts=` in
-[block/partitions/cmdline.c](https://github.com/torvalds/linux/blob/72d3fcf802c45d00b300f25b848a93c3a2bd7c7e/block/partitions/cmdline.c#L287)),
-and its writable data can sit in ext4 there:
-
-```
-  FLASH    no partition table and nothing recognised at offset 0; 2 flash filesystem(s) found by their own headers
-    @0x140000 squashfs       36.0 KiB  at byte 1,310,720
-    @0x150000 jffs2           2.7 MiB  at byte 1,376,256
-```
-
-An ext filesystem is taken only from a primary superblock (block group 0; a backup copy
-names its own group) whose root directory reads, and it ends at the block count it
-records. A superblock inside a filesystem already found, such as an ext image kept as a
-file, is not reported as another volume. A SquashFS volume ends where its superblock says;
-UBI runs over the following eraseblocks that carry the same image sequence number, or are
-erased; JFFS2 records no size, so it runs to the next volume found or the end of the
-image. YAFFS has no header to search for, so it is read only when it fills the image or a
-partition.
-
-Since 1.54 the same pass also finds two configuration stores a flash chip keeps beside its
-filesystems: the U-Boot environment, and the libnvram store Belkin WeMo devices keep, which
-opens with `NVRM`. Neither is a filesystem, so each is reported as a volume holding one
-file, `uboot-env.bin` or `nvram.bin`: the store's bytes as held on flash, for a consumer to
-parse. The report gives a store's layout and how many name=value strings it holds, never
-their values. A store is named by its layout, and the layout does not say which program wrote
-it. A store is taken only when its CRC-32 holds over it, at a size tried in 4 KiB
-steps up to 256 KiB, and a U-Boot environment only when its first string opens with a name
-and `=` and its strings end inside it. A store sits in its own MTD partition, so a JFFS2 in
-front of one ends where it begins. A partition or a file is taken for a store when the store
-fills it or only erased flash follows, so a dump that merely begins with an environment is
-still searched for the rest.
-
-The U-Boot layout is `env_t` in
-[include/env_internal.h](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/include/env_internal.h#L80-L86)
-(v2024.01): a little-endian CRC-32, a flags byte only on a board that keeps a redundant copy,
-then NUL-separated strings ending in an empty one, the CRC covering the rest of the
-environment as
-[`env_import`](https://github.com/u-boot/u-boot/blob/866ca972d6c3cabeaf6dbac431e8e08bb30b3c8e/env/common.c#L310)
-checks it. The libnvram layout is `env_image_gemtek` in Belkin's own libnvram source (its
-header carries Belkin's copyright), as found in a public copy of the WeMo firmware tree,
-[libnvram.c](https://github.com/svenschwermer/wemo/blob/46d0ccd248806e8e07210f9b34166b127e9d3d52/package/belkin_nvram_bd/src/libnvram.c#L97-L108):
-`NVRM`, a CRC-32 over the partition less the 16-byte header, an entry count and the offset
-of the end of the data, then the strings. The count and end of data are reported as stored
-and not checked, because the CRC does not cover them and libnvram rebuilds both from the
-strings. Both layouts are round-trip tested on stores the self-test builds, one U-Boot
-environment of each layout and an NVRM store after the JFFS2 fixture, with three controls
-that must not be claimed: one flipped data byte, strings that never end, and a CRC over a
-shorter length.
-
-Two JFFS2 partitions can sit side by side with nothing between them, an OpenWrt overlay
-followed by a vendor's settings partition for example. Each numbers its inodes and versions
-from 1, so read as one filesystem a name from one partition would show the other's file of
-the same number. Within one filesystem an inode number and version name one node (garbage
-collection copies a node unchanged, and the one rewrite that keeps a version, a partly
-overwritten hole, keeps its range), and a directory's version names one entry. So when a
-JFFS2 region holds two nodes with the same inode number and version but a different file
-type, range or data, or two entries with the same directory and version but a different
-name or target, obsolete nodes included, qnxprobe cuts the region along erase blocks
-(found from the spacing of the clean markers, else 4 KiB) into contiguous pieces with no
-such conflict inside any of them. Where more than one cut would do, it takes the one that
-separates the fewest names from their own inodes and directories, counting a name only
-where its recorded time matches a time on that inode or directory: the kernel gives a new
-file's name the new inode's time, a new symlink's, directory's or device's name a time read
-a moment after its inode's, and the directory the name's time. Each piece is then listed and read as its own filesystem. A
-region with no conflict is read whole, as before. Where a cut falls inside the erased
-blocks between two partitions cannot be known from the nodes, so the boundary is placed at
-the second partition's first block that holds one.
-
-A NAND dump taken with its spare bytes (for example by `nanddump --oob`) holds each page's
-data followed by its spare. YAFFS needs those bytes. For UBI and JFFS2 they are noise that
-does not look like noise: the spare holds error-correction bytes and, on NAND, JFFS2's own
-clean markers, and a UBI header in a 512-byte subpage sits inside the first page where the
-spare cannot disturb it. So qnxprobe tries the common page and spare sizes, reading the
-region with the spare stripped, when a UBI volume table does not read or no JFFS2 node
-opens the region, and says so in the report:
-
-```
-        NAND         a raw dump: 2048-byte pages each followed by 64 spare bytes, read with the spare stripped
-```
-
-Validated two ways. On dumps built from the fixtures: a 4 MiB NOR layout with 1.25 MiB of
-bytes no filesystem claims, then the SquashFS and JFFS2 images at 64 KiB boundaries, where
-both are found at their offsets and every entry is read, and the UBI and JFFS2 images with
-64 spare bytes after every 2 KiB page, where the geometry is found and every file matches.
-And on the two kernel-written NAND images, each a `nanddump --oob` of one partition of the
-kernel's simulated NAND chip (`nandsim`), where the geometry is found and every file
-matches the kernel's reading. The first run on those two images read the files of neither: the UBI
-dump mapped through its subpage headers and the JFFS2 dump opened with spare bytes, the
-two cases the paragraph above now handles, and neither had shown on the dumps built from
-fixtures. An image recognised at offset 0 is never searched further.
-
-### Kernel-written history
-
-`tools/make_kernel_flash_fixtures.sh` (Linux, root) builds the three kernel-written images.
-It first writes and deletes more data than the volume holds, so garbage collection runs
-and UBIFS commits, then makes the history: data overwritten in the middle and appended, a
-shrink followed by data written past the old end, a truncate that grows, a file written
-only far from its start, one file rewritten forty times, a deleted file and directory, a
-rename across directories, a rename over an existing name, a hard link whose first name is
-removed, a symlink, a permission change, and on UBIFS the unnamed file above. Every step
-is fsynced, and nothing after the first phase calls `sync()`, which on UBIFS runs a commit.
-The kernel then reads each image back: the NOR image through a copy mounted read-only, the
-NAND ones after being written back to an erased partition or mounted read-only again, and
-a second dump shows the kernel read the bytes that are committed (for UBI, only the two
-stale eraseblocks changed, erased by the kernel as older copies).
-
-These images are what make the history rules testable: a deliberate change to any of them
-(newest version or name first, journal replay, truncation, name deletion, keeping a
-relinked inode, the newest copy of a UBI block) turns the self-test red.
-
-## Split images
-
-FTK Imager and its peers write a raw image as numbered segments (`.001`, `.002`, ...)
-unless told to write one file, and the first segment alone is a trap: it carries the
-partition table and the boot volumes, so it identifies cleanly and its front volumes
-read correctly, while the volume holding the user data ends past the cut, where every
-read answers empty. Measured on a Ford Sync G4 image cut at 1,500 MB: every boot
-partition extracted in full and the 28.8 GiB storage volume walked to 0 files with
-nothing raised.
-
-Since 1.13 the tool joins the set itself. Name any one segment and every segment
-beside it (same folder, same stem, same number of digits) is read as one image, in
-order, with nothing copied or concatenated on disk:
-
-```
-python3 qnxprobe.py --extract case.zip mmcblk0.img.001    # .001 through the last segment beside it
-```
-
-The report says what was joined (`20 segments joined, mmcblk0.img.001 ..
-mmcblk0.img.020`, with the segment sizes), and in `volumes.json` every volume's
-`image` names the first segment while `image_segments` lists each one with its byte
-count, so the extraction can be checked back against the set.
-
-A set is joined only when it is whole from its first segment. A hole in the numbering
-(`.001` and `.003` with no `.002`), a set whose lowest segment is not `.000` or `.001`,
-and segments numbered at two different widths are each refused by name, with exit
-status 1, because a set joined around a hole reads every volume past it at the wrong
-offset and answers wrong rather than empty. A set that simply ends early cannot be
-told from a small disk by its numbering; that case is caught the other way, by the
-partition table reaching past the joined size, which draws the
-`IMAGE IS SHORTER THAN ITS PARTITION TABLE` warning described under "What it does not
-do".
-
-## EnCase/EWF and AFF acquisitions
-
-An acquisition is read directly, so a run on one works exactly like a run on a raw
-image:
-
-    python3 qnxprobe.py evidence.E01
-
-Since 1.38 that covers every disk image the vendored reader reads, each recognised
-by its own first bytes rather than its name:
-
-| Container | Point it at |
-| --- | --- |
-| EnCase/EWF (E01) | the `.E01` |
-| SMART (EWF-S01) | the `.s01` |
-| EWF2 (Ex01) | the `.Ex01` |
-| AFF | the `.aff` |
-| AFD, the folder of AFF files AFFLIB writes when an image is split | the `.afd` folder, or any `.aff` in it |
-| AFM, AFF metadata beside the disk as raw files, since 1.47 | the `.afm`, with its `.000`, `.001`, ... beside it |
-| an AFF, AFD or AFM AFFLIB encrypted, since 1.47 | the same, with its passphrase, or with `--private-key` when it is sealed to a certificate |
-| Apple disk image (UDIF), since 1.39 | the `.dmg` |
-| Apple disk image split by `hdiutil segment`, since 1.40 | the `.dmg`, with its `.dmgpart` files beside it |
-| Apple sparse image, since 1.39 | the `.sparseimage` |
-| Apple sparse bundle, since 1.40 | the `.sparsebundle` folder |
-| any of the Apple images above encrypted with a password, since 1.41 | the same, with its password |
-| any of the Apple images above sealed to a certificate, since 1.48 | the same, with `--private-key` (the certificate's RSA private key), or its password when it also has one |
-| an E01, SMART or raw (dd) set FTK Imager encrypted with AD encryption, since 1.42 | the first file (`.E01`, `.s01`), or any `.001`, `.002`, ... of a raw set, with its password |
-| such a set sealed to a certificate instead of a password, since 1.49 | the same, with `--private-key` (the certificate's RSA private key) |
-| AFF4 (standard v1.0 or Evimetry's pre-standard layout), since 1.44 | the `.aff4`, or any file of one striped across several, with the others beside it |
-| VHD, fixed, dynamic or differencing, since 1.46 | the `.vhd`; a differencing one with its parent beside it or where it names |
-| VHDX, fixed, dynamic or differencing, since 1.46 | the `.vhdx`, likewise |
-| VMDK, since 1.46 | the descriptor `.vmdk`, or any of its sparse extents, with its other files beside it |
-| QCOW, versions 1, 2 and 3, since 1.46 | the `.qcow` or `.qcow2`; an overlay with its backing file beside it |
-
-A `.dmg` is recognised by the trailer at its end. An uncompressed read-write `.dmg`
-has no trailer: it is the disk's bytes as they are, and has always been read as a raw
-image. An AFF4 is a ZIP, and is told from any other ZIP by the volume URI the AFF4
-Standard has its writer put in the ZIP comment or in a first member named
-`container.description`; ewfprobe reads its map, image streams (stored, Snappy, LZ4
-or deflate) and symbolic streams, and reports an AFF4 whose streams it cannot find
-beside it as incomplete. A `.dmg` compressed with LZFSE needs the optional `pyliblzfse` package beside
-ewfprobe, and is refused, naming it, without. Since 1.41 an Apple disk image encrypted
-with a password (`hdiutil -encryption`, AES-128 or AES-256; a `.dmg`, a split one, a
-`.sparseimage` or a `.sparsebundle`) is read with that password, which needs the
-optional `pycryptodome` package and is refused, naming it, without. Give the password
-with `--password-file FILE` (its first line) or `--password-env NAME` (an environment
-variable), both repeatable, and each image opens with the first that opens it; without
-either, qnxprobe asks at a terminal. The window asks for it once per image and keeps it
-in memory for the session, and hands it to the report it runs through an environment
-variable, never on a command line. From Python, `open_image(path, password=...)`
-raises `ImagePasswordError`, whose `wrong` says whether a password was given, when the
-image does not open. Before 1.41 an encrypted image was refused. Since 1.42 an E01,
-SMART or raw (dd) set FTK Imager encrypted with AD encryption opens the same way, with
-the same password options; `needs_password(path)` answers for both kinds, and
-`PASSWORD_FORMATS` names them as `acquisition_format` does (`DMG_ENCRYPTED`,
-`AD_ENCRYPTED`). Only the first file of such a set carries the encryption header, so
-a later numbered file of a raw set is recognised by its first. Before 1.42 an
-AD-encrypted set was read as raw bytes and nothing in it was recognised. A `.dmgpart` on
-its own is refused by the reader, which names the `.dmg` to open instead, and a split
-`.dmg` with a segment missing is refused rather than read short. A sparse bundle is
-recognised by its `Info.plist`, whatever the folder is called. Before 1.40 a sparse
-bundle stopped the run with a Python error (`IsADirectoryError`), and a split `.dmg`
-was refused. Before 1.39 a `.dmg` or `.sparseimage` was read as raw
-bytes; made from one test volume in every format `hdiutil` writes, the compressed ones
-(UDZO, UDBZ, ULMO, ULFO, UDCO), UDRO, the sparse image and an encrypted image all came
-back `not recognised`, and only the three that hold the disk's bytes in order (UDRW,
-`.cdr` and UFBI) were read.
-
-Before 1.38 only the E01 signature was recognised. An Ex01, AFF, AFD or L01 was
-read as raw bytes, and on every test acquisition of each that found no filesystem
-at all: the report said `whole image ... not recognised`.
-
-Since 1.47 an AFF AFFLIB encrypted opens with its passphrase, given the way any
-password is, or, when it is sealed to a certificate, with that certificate's RSA
-private key (`--private-key FILE`, repeatable; the window asks for the key file).
-`needs_password` and `needs_private_key` say which one an image needs, and
-`ImagePasswordError.needs` names it when neither was given. An AFF whose header was
-overwritten by a segment, as AFFLIB 3.7.22's `affcrypto -e` leaves a file it
-encrypts in place (AFFLIB cannot open it afterwards), is recognised by that segment
-and read from its segments. An `.afm` is read from the raw files beside it; before
-1.47 it was read as an AFF with every page missing, so the whole disk came back as the
-bad-sector marker and nothing on it was found.
-
-Since 1.48 an Apple disk image sealed to a certificate (`hdiutil create -certificate`)
-opens the same way, with that certificate's RSA private key; one that also has a
-password opens with either. Before 1.48 an image sealed only to a certificate was
-refused whatever was given. An image whose key is kept in a keybag is still refused,
-naming it.
-
-Since 1.49 an E01, SMART, raw or AD1 set FTK Imager sealed to a certificate with AD
-encryption opens the same way, with that certificate's RSA private key; before 1.49 it
-was refused as needing a password it could not use. An AD1 inside is still refused as
-logical evidence. `needs_password` and `needs_private_key` now ask the reader for an
-AD-encrypted set too, so one whose header is damaged is refused on opening rather than
-asking for a password first.
-
-Since 1.46 the disks virtual machines keep are read the same way: Microsoft's VHD and
-VHDX, VMware's VMDK and QEMU's QCOW, each recognised by its own bytes (a VHD by the footer at its end
-or the copy of it at its start). A differencing VHD or VHDX, a VMDK delta and a QCOW
-overlay are read through the disks under them, which the reader checks against the id
-the child records where the format keeps one; the report names each parent, and
-`volumes.json` lists every parent file with its byte count as `image_parents`, nearest
-first. A VMDK flat extent holds the disk's bytes as they are and is still read as raw.
-An encrypted QCOW is refused by the reader. Before 1.46 a fixed VHD was read as a raw
-image with its 512-byte footer at the end (on the one qemu-img 10.2.1 wrote, that still
-found its volume), and the dynamic VHD, VHDX, VMDK and QCOW2 disks qemu-img 10.2.1
-wrote, and a dynamic VHD Windows 11 wrote, each came back `whole image ... not
-recognised`. Extracting through a differencing VHD Windows 11 wrote now gives the same
-22 files, byte for byte, as extracting from the disk Windows presented, read through
-`\\.\PhysicalDriveN`.
-
-The segments of a multi-segment acquisition, and the files of an AFD, are joined by
-the reader from the format's own records, not from the file names, and a set
-missing a segment or a file is refused rather than read short.
-
-Logical evidence, EnCase's (`.L01`, `.Lx01`) and FTK Imager's (`.ad1`, `.ad2`, ...),
-holds copies of files, not a disk, so it has no partition table or filesystem for this
-tool to read. It is refused with a message saying so, and never read as raw bytes,
-including an AD-encrypted set that turns out, once opened with its password, to hold an
-L01 or an AD1. `ewfprobe.py` lists and exports the files of an L01 or an AD1
-(`python3 ewfprobe.py files evidence.ad1`).
-
-This is `ewfprobe.py`, vendored from
-[abrignoni/ewfprobe](https://github.com/abrignoni/ewfprobe) and recorded in
-`vendored.json`. It is MIT, pure Python and standard library only, so it adds
-nothing to build and nothing to install; only an LZFSE `.dmg` and an encrypted image
-(an Apple disk image or an AD-encrypted acquisition) need an optional package, and the
-release executables carry the one for encrypted images. `tools/check_vendored.py` confirms the
-copy still matches what was vendored, and reports a copy it could not check
-separately from one that has drifted, because those are different results.
-
-The reader is optional. Without `ewfprobe.py` beside this script everything else
-works as before, and an acquisition is refused with a message saying what is
-missing.
-It is never read as raw bytes: a container read that way holds no filesystem the
-walkers can see, so the run would report an empty image instead of saying it
-could not read the container.
-
-Measured with 1.27 on a 15-segment FTK Imager acquisition of a 232.9 GiB Windows
-disk: the segments join, the GPT and its four partitions are read, the EFI system
-partition is identified as FAT32 and the basic data and recovery partitions as
-NTFS, all in about a second. Only the 16 MiB Microsoft reserved partition is
-reported as not recognised, with its first bytes shown.
-
-## Options
-
-| Option | What it does |
-| --- | --- |
-| `--list` | Walk each filesystem found and list its contents (qnx6, qnx4, ext2/3/4, F2FS, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS boot images) |
-| `--depth N` | How deep to walk with `--list` (default 2) |
-| `--list-max N` | Stop after this many entries per filesystem (default 400) |
-| `--extract OUT.zip` | Copy the logical files out of every filesystem into a zip |
-| `--unallocated DIR` | Write the free space of every volume whose filesystem reports it into DIR, with a map back to the image. See [Writing free space to files](#writing-free-space-to-files) |
-| `--only TEXT` | Restrict `--list`, `--extract` and `--unallocated` to partitions whose name or label contains TEXT |
-| `--exclude TEXT` | Skip any path containing TEXT when extracting. Repeatable |
-| `--triage` | Rank volumes by how much each has been written, and flag encrypted or bulk ones |
-| `--progress` | While extracting, emit one JSON progress object per line on stderr, for a caller driving this as a subprocess. The report on stdout is unchanged |
-| `--password-file FILE` | For an encrypted image (an Apple disk image, an AD-encrypted FTK Imager acquisition or an encrypted AFF), a BitLocker volume or an encrypted APFS volume: a password or recovery password (for APFS, the personal recovery key), the first line of FILE. Repeatable |
-| `--password-env NAME` | For an encrypted image, a BitLocker volume or an encrypted APFS volume: a password, from the environment variable NAME. Repeatable. Without either, qnxprobe asks at a terminal for an encrypted image's password |
-| `--bitlocker-key FILE` | A BitLocker startup key (a `.BEK` file), tried against every BitLocker volume. Repeatable |
-| `--private-key FILE` | For an AFF, an Apple disk image or an AD-encrypted set sealed to a certificate, the certificate's RSA private key, unencrypted, as PEM or DER. Repeatable |
-| `--scan-limit MiB` | How far to brute scan when no superblock sits at the offsets the kernel checks (default 256) |
-| `--self-test` | Build throwaway positive and negative images, confirm the detector reports both ways, then delete them |
-| `--version` | Print the version |
-
-## The self-test, and why it is not decoration
-
-Run it once before you trust a negative result on real evidence.
-
-```
-python3 qnxprobe.py --self-test
-```
-
-It builds throwaway images in a temp directory, some that must be detected and one
-that must not, across qnx6 (both endians), QNX4, ext4, ext2, F2FS, FAT32, exFAT, NTFS, HFS+, APFS, ETFS, EFS and QNX IFS,
-checks them, and removes the directory. For ETFS it also round-trips one file out of
-a synthetic image, so a broken structure offset, not just a broken constant, turns
-the leg red. For IFS the UCL decoder is run against a fixed synthetic block whose
-expected output is written out by hand, and a flipped byte in a synthetic imagefs
-must break the image checksum, so a regression in the decompressor or the walk
-turns a leg red rather than passing against itself.
-
-The expected values in it are written as literal bytes rather than derived from the
-constant they verify. That matters: an earlier version built its fixtures from
-`QNX6_MAGIC`, and it passed with the magic deliberately corrupted to `0x68191123`,
-which is a build that cannot identify a single real filesystem. A test whose fixture
-moves with the bug is not a test. The same discipline covers the ETFS reserved names
-and the EFS `QSSL_F3S` signature: break one of those literals and the self-test
-exits 1.
-
-## A magic match is not a finding
-
-Across a 256 MiB scan you expect roughly one 4-byte magic hit by chance. Every
-candidate is therefore parsed as a superblock and its fields checked for internal
-consistency before it is reported CONFIRMED. The run tells you how many matches were
-rejected as coincidence.
-
-## Where the constants come from
-
-Nothing here is assumed. Every constant and field offset is read out of the
-producer's own source.
-
-QNX6, from the Linux kernel's qnx6 driver:
-
-```
-QNX6_SUPER_MAGIC     0x68191122   include/uapi/linux/magic.h:55
-QNX6_BOOTBLOCK_SIZE      0x2000   include/linux/qnx6_fs.h:23
-QNX6_SUPERBLOCK_SIZE      0x200   include/linux/qnx6_fs.h:21
-struct qnx6_super_block               include/linux/qnx6_fs.h:94
-```
-
-`fs/qnx6/inode.c` reads the first superblock at `QNX6_BOOTBLOCK_SIZE` and, if the
-magic is wrong there, retries at offset 0. It tries little endian first, then big
-endian, so both are live in the wild and both are checked.
-
-ext2/3/4:
-
-```
-EXT2_SUPER_MAGIC     0xEF53   linux/include/uapi/linux/magic.h:24
-EXT4_EXT_MAGIC       0xf30a   linux/fs/ext4/ext4_extents.h
-struct ext4_super_block, ext4_group_desc, ext4_inode, ext4_dir_entry_2
-                              linux/fs/ext4/ext4.h
-```
-
-The ext field offsets were derived from that header and cross-checked against its own
-`/*NN*/` offset markers, all fifteen of which agreed, with the struct totalling the
-expected 1024 bytes.
-
-F2FS, from the Linux kernel at v7.0 (commit
-`028ef9c96e96197026887c0f092424679298aae8`):
-
-```
-F2FS_SUPER_MAGIC     0xF2F52010   include/linux/f2fs_fs.h
-struct f2fs_super_block, f2fs_checkpoint, f2fs_inode, node_footer,
-  f2fs_dir_entry, f2fs_dentry_block, f2fs_nat_entry
-                                  include/linux/f2fs_fs.h
-current_nat_addr, get_node_path   fs/f2fs/node.{h,c}
-validate_checkpoint               fs/f2fs/checkpoint.c
-sanity_check_raw_super            fs/f2fs/super.c
-read_normal_summaries             fs/f2fs/segment.c   (the NAT journal)
-do_read_inode                     fs/f2fs/inode.c
-f2fs_fill_dentries                fs/f2fs/dir.c
-```
-
-The inode's address count, the direct/indirect node layout and the NAT block
-addressing are all parameterised by the superblock's block size, so a 4K-block
-and a 16K-block volume are read the same way.
-
-QNX IFS boot images, from QNX's own `dumpifs` and `sys/image.h`:
-
-```
-STARTUP_HDR_SIGNATURE  0x00ff7eeb   qnx sys/startup.h:88
-STARTUP_HDR_VERSION             1   qnx sys/startup.h:89
-struct startup_header               qnx sys/startup.h
-flags1 compression, block framing   qnx dumpifs.c  (none/zlib/lzo/ucl)
-struct image_header, image_dirent   qnx sys/image.h
-UCL NRV2B (_8) decompressor          Oberhumer UCL src/n2b_d.c, src/getbit.h
-```
-
-The startup header's field widths sum to 256 bytes, which each image's own
-`header_size` field confirms, and the `machine` field is an ELF machine type
-(`EM_386` 3, `EM_ARM` 40, `EM_X86_64` 62, `EM_AARCH64` 183 from
-`linux/include/uapi/linux/elf-em.h`). `flags1` gives the compression method; a
-compressed imagefs is a run of blocks, each a two-byte big-endian length then
-that many bytes decompressing to at most 64 KiB, ending at a zero length. Each
-UCL block is NRV2B, ported from Oberhumer's UCL into a small pure-Python decoder
-so the tool still installs nothing, and `zlib` images are read through the
-standard library. The decompressed image is walked from its `image_header` and a
-flat table of `image_dirent` records.
-
-This is proven byte for byte against the Ford Sync G4 `ifs_a`, `ifs_b` and
-`ifs_recovery` volumes: each decompressed to exactly the `imagefs_size` its own
-header records, the 32-bit words from the header through the `image_trailer`
-summed to zero against the trailer's checksum, and the extracted files were
-valid, including the AArch64 ELF kernel `procnto-smp-instr` whose machine matched
-the startup header. That checksum is reported on every run as a decode self-check.
-
-QNX4, from the Linux kernel's read-only qnx4 driver, the same sourcing as qnx6:
-
-```
-QNX4_SUPER_MAGIC       0x002f   linux/include/uapi/linux/magic.h:54
-struct qnx4_inode_entry         linux/include/uapi/linux/qnx4_fs.h:44
-struct qnx4_link_info           linux/include/uapi/linux/qnx4_fs.h:63
-struct qnx4_xblk ("IamXblk")    linux/include/uapi/linux/qnx4_fs.h:71
-field widths                    linux/include/uapi/linux/qnxtypes.h
-directory entry union           linux/fs/qnx4/qnx4.h:75
-```
-
-The `0x002f` magic is simply the `/` name of the root directory inode at the
-start of the superblock, 512 bytes into the volume. Blocks are 512 bytes and
-1-based on disk. A directory's data is a run of 64-byte entries: a name up to
-16 bytes is a full inode entry stored inline, a longer name (up to 48) is a
-link entry resolving to the real inode by block and index, conventionally
-inside the `.inodes` file. A file's extents 2..n live in a chain of `IamXblk`
-blocks, followed exactly as `fs/qnx4/inode.c qnx4_block_map()` follows them.
-Detection requires what the kernel itself requires to mount: the `/` root
-inode with a directory mode and a `.bitmap` entry in the root directory
-(`qnx4_checkroot`). A QNX4 boot block can end in `0x55AA`, so the MBR parser
-declines a sector whose following sector is a QNX4 root superblock, the same
-shared-magic rule as FAT above.
-
-A qnx6 boot block can end in `0x55AA` as well: on qnxmount's qnx6 reference image
-sector 0 is x86 boot code, and its bytes at 446 parse as two partitions starting
-1.5 and 1.8 TB into a 400 KB file. Taking that table at face value hid the
-filesystem entirely, since the qnx6 at offset 0 then had no partition to be listed
-or extracted from and its end-of-volume superblock, the active generation, was never
-probed. So the MBR parser first checks for a consistent qnx6 superblock at `0x2000`,
-the offset the Linux driver reads (`fs/qnx6/inode.c`, `qnx6_fill_super`), and
-declines the sector if one is there. As a last resort it also declines any table none
-of whose partitions begins inside the image. The boot indicator byte is not used as a
-test, because neither util-linux's libfdisk nor The Sleuth Kit rejects a table on it.
-The self-test builds an image of this shape and requires both superblock copies to be
-found and the volume to be listed.
-
-Since 1.31 the GPT is read as UEFI 2.10 section 5.3 lays it out. The primary header is at LBA 1,
-so its byte offset is the logical sector size: 512 on most disks, 4096 on 4Kn drives
-and UFS LUN images, and both are tried. A header is used only when it passes the four
-checks the spec lists in section 5.3.2: the `EFI PART` signature, HeaderCRC32 over
-HeaderSize bytes with that field set to zero, MyLBA naming the block it was read from,
-and the CRC32 of the partition entry array, with the offsets from Table 5.5 and the
-entry fields from Table 5.6. When the primary fails, the backup header in the last
-logical block is read, as that section says to, but only when sector 0 holds a
-protective `0xEE` record, because the same section warns that a disk reformatted to a
-legacy MBR can keep a stale GPT there. The report names every header it did not use
-and why, and says when the backup was the one read. On a 4096-byte disk the MBR's LBAs
-are counted in 4096-byte sectors too: Table 5.4 starts the protective record at LBA 1,
-"the LBA of the GPT Partition Header". The self-test builds a GPT at each size around
-the ext4 fixture and requires the volume at the byte its entry names. Those images read
-the same in The Sleuth Kit's `mmls -b 4096` and in util-linux `sfdisk --sector-size
-4096`, and a GPT that `sfdisk` wrote with 4096-byte sectors is read as `sfdisk` wrote it.
-
-The QNX4 reader was validated by round-trip against the Linux kernel driver
-itself: a fixture populated with nested directories, a multi-extent file, a
-long name, a symlink, an empty file and distinct modes, owners and mtimes was
-mounted read-only with `fs/qnx4` on kernel 7.0.0, and every path, type,
-permission, owner, size, mtime, symlink target and byte of content the kernel
-reported matched what this walker reads, 15 of 15 entries. The fixture was
-written by a separate generator program (its skeleton follows Peter
-Waechtler's Linux-side QNX4 `dinit`, a second independent statement of the
-layout), not by this parser, so the two sides are independent.
-
-QNX ETFS and EFS, from [NetherlandsForensicInstitute/qnxmount](https://github.com/NetherlandsForensicInstitute/qnxmount)
-(Apache-2.0):
-
-```
-etfs_trans, fid scheme, ftable + dir entry   qnxmount/etfs/parser.ksy -> fs/etfs.h
-F3S extent, unit, boot, dir entry            qnxmount/efs/parser.ksy  -> fs/f3s_spec.h
-```
-
-qnxmount is a peer institute's vehicle-forensics reader. Its ETFS spec cross-references
-QNX's own `fs/etfs.h` and its EFS spec `fs/f3s_spec.h`; only the field layouts are
-transcribed here, into the same hand-written struct style, so the Kaitai runtime is not
-a dependency and the tool stays standard library only. Both readers were validated by
-extracting qnxmount's own committed test images and comparing every name, mode, owner,
-timestamp, symlink target and byte of content against the tar archive built from the
-same live filesystem, which qnxmount produced on QNX independently of this code: ETFS
-matched 32 of 32 entries, EFS 31 of 31. ETFS has no magic, so it is claimed only when
-the page geometry divides evenly and the `.filetable` carries its fixed reserved names
-at their fixed ids; EFS is claimed by its `QSSL_F3S` boot record. Neither fired on the
-u-boot, boot_fs or ext partitions of the two vehicle images tested.
-
-SquashFS, JFFS2, UBI and UBIFS, from the Linux kernel at v7.0 (commit
-`028ef9c96e96197026887c0f092424679298aae8`):
-
-```
-SQUASHFS_MAGIC  0x73717368 ("hsqs")     include/uapi/linux/magic.h:20
-struct squashfs_super_block             fs/squashfs/squashfs_fs.h:241
-inode, directory, fragment layouts      fs/squashfs/squashfs_fs.h:270-424
-metadata block 8 KiB, bit 15 stored     fs/squashfs/squashfs_fs.h:19,106
-data block, bit 24 stored               fs/squashfs/squashfs_fs.h:113
-JFFS2_MAGIC_BITMASK 0x1985, old 0x1984  include/uapi/linux/jffs2.h:24-25
-JFFS2 compressor ids                    include/uapi/linux/jffs2.h:41-48
-struct jffs2_unknown_node, raw_dirent,  include/uapi/linux/jffs2.h:102,111,135
-  raw_inode
-UBI_EC_HDR_MAGIC "UBI#", VID "UBI!"     drivers/mtd/ubi/ubi-media.h:29,31
-struct ubi_ec_hdr, ubi_vid_hdr          drivers/mtd/ubi/ubi-media.h:147,268
-UBI_CRC32_INIT 0xFFFFFFFF               drivers/mtd/ubi/ubi-media.h:26
-layout volume 0x7FFFEFFF                drivers/mtd/ubi/ubi-media.h:294,298
-struct ubi_vtbl_record (172 bytes)      drivers/mtd/ubi/ubi-media.h:355
-UBIFS_NODE_MAGIC 0x06101831             fs/ubifs/ubifs-media.h:25
-superblock, master and log LEBs         fs/ubifs/ubifs-media.h:227-231
-key: block or hash bits 29              fs/ubifs/ubifs-media.h:199
-```
-
-How each reader chooses among versions and copies is taken from the code that makes the
-choice, and cited beside the Python that follows it: `fs/jffs2/readinode.c`
-(`check_node_data`, `read_direntry`, `jffs2_do_read_inode_internal`) for JFFS2,
-`drivers/mtd/ubi/attach.c` (`ubi_compare_lebs`) for UBI, and `fs/ubifs/replay.c`
-(`apply_replay_entry`, `inode_still_linked`, `trun_remove_range`) for the UBIFS journal.
-
-LZO and LZ4 are not in the standard library, so both are carried as pure-Python decoders.
-LZO1X is written from the kernel's `Documentation/staging/lzo.rst` and
-`lib/lzo/lzo1x_decompress_safe.c` at the same commit, and LZ4 from
-`doc/lz4_Block_format.md` in lz4 at v1.10.0 (commit
-`ebb370ca83af193212df4dcbadcc5d87bc0de2f0`). Every fixture compressed with them reads back
-byte for byte, and each source tree carries a file shaped to reach the decoders' rarer
-instructions. LZO-RLE, the second LZO bitstream, which zram writes and none of these
-filesystems does, is refused rather than decoded. The kernel does not read SquashFS's
-legacy lzma format, so that one follows squashfs-tools' own `lzma_xz_wrapper.c` at commit
-`708c59ae80853b0845017c33b42e56061cc546cd`. Mainline Linux has no JFFS2 LZMA either, so
-compression 8 follows the OpenWrt patch that adds it,
-`target/linux/generic/pending-6.12/530-jffs2_make_lzma_available.patch` at OpenWrt commit
-`d9f8ecc394dd30537d7136963fa4f6891b59c1ee` (the id at line 1094, the decoder at lines 200
-to 214, the properties at 229 to 237 and 342 to 348), and its fixture is written by the
-matching `tools/mtd-utils/patches/130-lzma_jffs2.patch` on mtd-utils 2.3.1.
-
-YAFFS1 and YAFFS2, from Aleph One's
-[yaffs2](https://github.com/Aleph-One-Ltd/yaffs2) at commit
-`474b3acb927d27b2305618aaf24456b9d33fe91b`. The object header's field offsets were printed
-with `offsetof()` from that tree's own headers rather than counted by hand:
-
-```
-object ids: root 1 .. summary 0x10      core/yaffs_guts.h:94-100
-sequence numbers 0x1000..0xefffff00     core/yaffs_guts.h:123-124
-struct yaffs_spare (YAFFS1 tags)        core/yaffs_guts.h:225
-struct yaffs_obj_hdr (512 bytes)        core/yaffs_guts.h:330
-YAFFS2 packed tags and their ECC        core/yaffs_packedtags2.c
-YAFFS2 scan                             core/yaffs_yaffs2.c yaffs2_scan_chunk
-YAFFS1 tags and deletion                core/yaffs_tagscompat.c, core/yaffs_yaffs1.c
-root and lost+found modes 0755, 0700    direct/ydirectenv.h:99-100
-```
-
-BitLocker, from Joachim Metz's
-[BitLocker Drive Encryption (BDE) format specification](https://github.com/libyal/libbde/blob/96e3c5dce6143c2702c90f3903018fb8c12a8956/documentation/BitLocker%20Drive%20Encryption%20(BDE)%20format.asciidoc)
-in libyal/libbde at commit `96e3c5dce6143c2702c90f3903018fb8c12a8956`, and for how a
-sector is read back, libbde's own code at the same commit:
-
-```
-volume header, FVE metadata blocks and entries   the format document
-recovery password and user key stretching        sections "Recovery key", "User key"
-AES-CBC IV, AES-XTS tweak                        sections "AES-CBC", "AES-XTS"
-moved first sectors, zeroed metadata, the
-encrypted size, unencrypted ranges               libbde/libbde_sector_data.c:274-420
-Encrypt-on-Write map                             libbde/libbde_volume.c:1668
-bytes per sector from the moved header           libbde/libbde_volume.c:1497-1506
-```
-
-NTFS reparse points, cloud placeholders and overlay compression, from Microsoft:
-
-```
-reparse tags (IO_REPARSE_TAG_WOF, _CLOUD to _CLOUD_F)   [MS-FSCC] 2.1.2.1
-file attributes (SPARSE_FILE, OFFLINE,
-RECALL_ON_DATA_ACCESS)                                  [MS-FSCC] 2.6
-overlay reparse data: version, provider, then the
-file provider's version and algorithm                   WOF_EXTERNAL_INFO,
-                                                        FILE_PROVIDER_EXTERNAL_INFO_V1
-XPRESS chunk sizes, LZX's 32 KB                         WOF_FILE_COMPRESSION_INFO_V1
-LZ77+Huffman block: 256 bytes of code lengths for
-512 symbols, then the symbols                           [MS-XCA] 2.1
-```
-
-The algorithm numbers, the chunk table of the `WofCompressedData` stream and the order
-of the decoder's reads are checked against files Windows wrote and Windows's own hashes
-of them (the self-test), and `SF_DATALESS` is from macOS's `sys/stat.h`.
-
-`--help` prints this same sourcing, so it travels with the tool.
-
-## What it does not do
-
-- **It reads raw images and the acquisitions `ewfprobe.py` reads only.** A raw image
-  is one file or the numbered segments of one, and an E01, s01, Ex01, AFF, AFD, AFF4,
-  `.dmg` (split into `.dmgpart` files or not), `.sparseimage` or `.sparsebundle`,
-  (since 1.46) a VHD, VHDX, VMDK or QCOW virtual disk, and (since 1.47) an AFM or an
-  encrypted AFF, is read
-  through `ewfprobe.py` (see "EnCase/EWF and AFF acquisitions" above). L01, Lx01 and
-  (since 1.45) AD1 logical evidence is refused, since it holds no disk. Other evidence containers
-  are not decoded; such a file is read as plain raw bytes, so export the raw image
-  from the imaging tool first. A segment set is joined only when it is whole from its first
-  segment (see "Split images" above). A lone first segment is read as the file it is,
-  and since 1.12 a run on it says `IMAGE IS SHORTER THAN ITS PARTITION TABLE`, names
-  the partitions that reach past the end, marks each affected volume `INCOMPLETE` in
-  the report and in `volumes.json` (`extends_past_image_by_bytes`), and stores a file
-  whose blocks lie past the cut under a name ending `.SHORT-<here>-of-<size>-bytes`,
-  counted as `short` rather than as extracted.
-- **A 4096-byte-sector disk is recognised by its GPT.** A 4Kn disk that carries only
-  a legacy MBR states its sector size nowhere, so its LBAs are read as 512-byte
-  sectors. Sector sizes other than 512 and 4096 are not probed. A GPT header that fails
-  a check is reported and not used, and nothing is ever written back to restore one.
-- **Some IFS compression is recognised but not read.** UCL, zlib and uncompressed
-  QNX IFS boot images are listed and extracted; `lzo`-compressed images and the Harman
-  Becker HBCIFS container are recognised and reported but not decompressed, because no
-  sample exists to validate a reader against. A big-endian IFS is declined the same way.
-  In each case the header is still reported and the walk is declined out loud.
-- **It decrypts BitLocker and APFS volume encryption, not per-file encryption.** An
-  encrypted Apple disk image or an AD-encrypted acquisition opens with its password, a
-  BitLocker volume with its key, and an APFS volume macOS encrypted in software with its
-  password or personal recovery key (above). An APFS volume with per-file keys, one that
-  was mid-way through being encrypted, an NTFS file encrypted on its own, and a volume
-  with encrypted filenames are flagged, not opened; an APFS volume the image holds
-  decrypted is read (see APFS above). A BitLocker volume with the Elephant diffuser, in the Windows Vista layout, or
-  protected only by a TPM is named and not read.
-  On F2FS, a real Android `/data` uses per-file encryption: such a file is listed and
-  its content refused rather than guessed at.
-- **Overlay compression with LZX is recognised but not read.** A file compressed with
-  `compact /exe:lzx` is listed with its recorded size and refused by name; the three
-  XPRESS forms are decoded. A cloud provider's online-only placeholder holds no content
-  on the volume and is refused too, rather than written out as zeros.
-- **F2FS compression is recognised but not read.** A file compressed with F2FS's LZ4,
-  LZO or zstd clusters is listed with its recorded size and not decompressed.
-- **F2FS is validated against synthetic fixtures, not yet against a real F2FS volume.**
-  Two independent readers are the oracles: f2fs-tools' `dump.f2fs` for inline data,
-  directories, the inode's own pointers and direct and single-indirect node blocks, and
-  the Linux kernel driver itself for files full of holes. No real F2FS volume is in the
-  test corpus, so the NAT-journal override is implemented and sourced but not exercised (a
-  cleanly unmounted image has an empty journal), and the double-indirect path (past about
-  8 GiB in one file) is not exercised at all.
-- **It does not write.** The image is opened read-only. The Linux qnx6 driver has no
-  write path at all, so mounting a qnx6 volume on Linux cannot alter these timestamps
-  either.
-- **QNX4 is validated against a synthetic fixture, not yet against a real QNX4
-  volume.** The round-trip oracle is the Linux kernel's own `fs/qnx4` driver, an
-  independent implementation, but no confirmed real QNX4 volume exists in the
-  test corpus; the one candidate partition (a Ford Sync G4 slot named
-  `boot_fs`) turned out to carry a `RAW0` container, not QNX4.
-- **ETFS and EFS are validated against qnxmount's synthetic test images, not yet
-  against a real vehicle extraction.** No confirmed ETFS or EFS volume was available to
-  test on. ETFS in particular keeps its transaction metadata in the NAND spare/out-of-band
-  area, so an ETFS volume is only readable if the acquisition captured that spare area;
-  an image that dropped it will not divide into pages and will be reported as not
-  recognised rather than misread.
-- **SquashFS and JFFS2 have not been run against flash from a real device.** Their images
-  were written by the formats' own tools and, for JFFS2's history, by the Linux kernel's
-  driver on the kernel's simulated NAND chip (`nandsim`) rather than on hardware. YAFFS2
-  and UBIFS have been: an Android phone under
-  [YAFFS1 and YAFFS2](#yaffs1-and-yaffs2), and that phone and a Foscam R2 camera under
-  [Deleted files on YAFFS2, JFFS2 and UBIFS](#deleted-files-on-yaffs2-jffs2-and-ubifs).
-  The older copies in the UBI fixture were put there from an earlier dump rather than left
-  by a real power cut, and UBI's fallback to an older copy when a moved block's data CRC
-  fails is implemented and sourced but not exercised. YAFFS2's skipping of block summary
-  chunks is exercised (the YAFFS2 history image holds 24) but decides nothing there: those
-  chunks reach no listing either way.
-- **Some flash compression is recognised but not read.** zstd needs Python 3.14 or later
-  (`compression.zstd`). On an older Python a zstd SquashFS is identified but cannot be
-  listed, since its directory tables are compressed too; since 1.34 `volumes()` carries
-  the reason as the volume's note, so the report, the window and a LEAPP run log say why
-  it lists nothing. In UBIFS each file whose data
-  is zstd-compressed is named and refused. The executables published with v1.31 and v1.32
-  were built on Python 3.12 and so do not read zstd; later ones are built on 3.14 and do.
-  JFFS2's rubin, dynrubin and copy compressors are reported and not read, and LZO-RLE is
-  refused.
-- **Older and unusual flash layouts are not walked.** SquashFS 1.x to 3.x (and its
-  big-endian `sqsh` form) and JFFS2's original 0x1984 layout are recognised and reported.
-  YAFFS2 with inband tags (kept inside the page, on NAND with no usable spare) is not
-  recognised at all.
-- **Older versions of live files on flash are not listed.** Each flash reader returns the
-  filesystem's current state, the way the filesystem itself reads it, and deleted files
-  come from `recover_deleted()` (above). The earlier contents of a file that still exists
-  (JFFS2's superseded nodes, YAFFS's superseded pages, UBIFS's older data nodes, UBI's old
-  copies of a block) are not returned, and neither is deleted YAFFS1 data.
-- **Encrypted and authenticated UBIFS.** Encryption is not undone: a file fscrypt marks as
-  encrypted has its content refused rather than returned, and encrypted names are not
-  decrypted. The hashes of an authenticated volume are not checked. Neither case is in the
-  fixtures. Extended attributes are not reported on any of the flash filesystems.
-- **A raw flash dump is searched only for SquashFS, UBI and JFFS2**, only when it has no
-  partition table and nothing is recognised at offset 0, and only up to 8 GiB. Its spare
-  bytes are stripped only for UBI and JFFS2, and only for the common page and spare sizes.
-  NAND dumps with spare bytes were tested as dumps of one partition each; a filesystem
-  that starts further into such a dump has not been tested.
-
-## License
-
-MIT. See [LICENSE](LICENSE).
+`encrypted, opened with a password`, and the note says so. Without a key that …30950 tokens truncated…t=mono)
+    ys = ttk.Scrollbar(rep, orient="vertical", command=text.yview)
+    xs = ttk.Scrollbar(rep, orient="horizontal", command=text.xview)
+    text.configure(yscrollcommand=ys.set, xscrollcommand=xs.set, state="disabled")
+    text.grid(row=0, column=0, sticky="nsew")
+    ys.grid(row=0, column=1, sticky="ns")
+    xs.grid(row=1, column=0, sticky="ew")
+    rep.rowconfigure(0, weight=1)
+    rep.columnconfigure(0, weight=1)
+
+    con = ttk.Frame(nb)
+    nb.add(con, text="Contents")
+    cbar = ttk.Frame(con, padding=(0, 6))
+    cbar.pack(fill="x")
+    ttk.Label(cbar, text="Image").pack(side="left")
+    combo = ttk.Combobox(cbar, state="readonly", width=60)
+    combo.pack(side="left", padx=6, fill="x", expand=True)
+    b_load = ttk.Button(cbar, text="Load contents")
+    b_load.pack(side="left")
+    b_save = ttk.Button(cbar, text="Save selected file...", state="disabled")
+    b_save.pack(side="left", padx=(6, 0))
+
+    # Created and Accessed fill where the walker keeps instants for them, which
+    # is NTFS through stamps(); every other reader carries only the modified
+    # time, so those two stay blank there rather than show a date nothing read.
+    # A FAT32 or exFAT walker keeps readings rather than instants, so for it
+    # the three (UTC) columns stay blank and the readings go in the last column
+    # as stored, the way GLEAPP's gallery shows the same file.
+    tree = ttk.Treeview(con, columns=("kind", "size", "mtime", "created", "accessed", "recorded"),
+                        selectmode="browse")
+    tree.heading("#0", text="Name")
+    tree.heading("kind", text="Kind")
+    tree.heading("size", text="Size")
+    tree.heading("mtime", text="Modified (UTC)")
+    tree.heading("created", text="Created (UTC)")
+    tree.heading("accessed", text="Accessed (UTC)")
+    tree.heading("recorded", text="Recorded (as stored)")
+    tree.column("#0", width=520, stretch=True)
+    tree.column("kind", width=110, stretch=False)
+    tree.column("size", width=110, anchor="e", stretch=False)
+    tree.column("mtime", width=170, stretch=False)
+    tree.column("created", width=110, stretch=False)
+    tree.column("accessed", width=110, stretch=False)
+    tree.column("recorded", width=420, stretch=False)
+    tys = ttk.Scrollbar(con, orient="vertical", command=tree.yview)
+    tree.configure(yscrollcommand=tys.set)
+    tree.pack(side="left", fill="both", expand=True)
+    tys.pack(side="right", fill="y")
+
+    # ---- signature carving (independent read-only handle) -----------------
+    import qnxprobe_carving as carving
+    car = ttk.Frame(nb)
+    nb.add(car, text="Carving")
+    cb = ttk.Frame(car, padding=6)
+    cb.pack(fill="x")
+    ttk.Label(cb, text="Uses image selected in Contents; scans entire logical image.").pack(anchor="w")
+    ttk.Label(cb, text="Contiguous candidates only; hits may belong to live files. No original names/timestamps.").pack(anchor="w")
+    controls = ttk.Frame(cb)
+    controls.pack(fill="x")
+    types = {k: tk.BooleanVar(value=True) for k in carving.SIGNATURES}
+    for kind, var in types.items():
+        ttk.Checkbutton(controls, text=kind.upper(), variable=var).pack(side="left")
+    ttk.Label(controls, text="Max MiB/file").pack(side="left")
+    max_mib = tk.StringVar(value="64")
+    ttk.Entry(controls, textvariable=max_mib, width=7).pack(side="left")
+    cs = dict(hits={}, path=None, busy=False)
+    cq = queue.Queue()
+    stop_carving = threading.Event()
+    carve_status = tk.StringVar(value="Ready")
+    ttk.Label(cb, textvariable=carve_status).pack(anchor="w")
+    ct = ttk.Treeview(car, columns=("offset", "size", "type", "validation"), show="headings")
+    for col in ("offset", "size", "type", "validation"):
+        ct.heading(col, text=col.title())
+    ct.pack(fill="both", expand=True)
+
+    def poll_carving():
+        for _ in range(200):
+            try:
+                tag, value = cq.get_nowait()
+            except queue.Empty:
+                break
+            if tag == "hit":
+                iid = ct.insert("", "end", values=(hex(value["offset"]), value["size"], value["type"], value["validation"]))
+                cs["hits"][iid] = value
+            elif tag == "progress":
+                carve_status.set(f"Scanning {value:.1%}; {len(cs['hits'])} candidates")
+            else:
+                cs["busy"] = False
+                carve_start["state"] = "normal"
+                carve_export["state"] = "normal"
+                carve_status.set(str(value))
+        if cs["busy"] or not cq.empty():
+            root.after(50, poll_carving)
+
+    def start_carving():
+        path = combo.get()
+        try:
+            limit = int(max_mib.get()) * 1024 * 1024
+            selected = [k for k, var in types.items() if var.get()]
+            if not path or limit <= 0 or not selected:
+                raise ValueError("Select an image, file types and a positive maximum size.")
+        except ValueError as exc:
+            messagebox.showerror("Carving", str(exc))
+            return
+        if not unlock(path):
+            return
+        cs.update(path=path, hits={}, busy=True)
+        ct.delete(*ct.get_children())
+        stop_carving.clear()
+        carve_start["state"] = carve_export["state"] = "disabled"
+        password = state["passwords"].get(path)
+        key = state["aff_keys"].get(path)
+        def work():
+            try:
+                with q.open_image(path, password=password, private_key=key) as fh:
+                    for hit in carving.scan(fh, q.image_size(fh), selected, limit,
+                                            stop_carving.is_set,
+                                            lambda v: cq.put(("progress", v))):
+                        cq.put(("hit", hit))
+                cq.put(("done", "Cancelled (partial results)" if stop_carving.is_set() else "Scan complete"))
+            except Exception as exc:
+                cq.put(("error", str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+        root.after(50, poll_carving)
+
+    def export_carving():
+        hits = [cs["hits"][i] for i in ct.selection()]
+        if not hits:
+            messagebox.showinfo("Carving", "Select one or more candidates first.")
+            return
+        folder = filedialog.askdirectory(title="Parent folder for a new carving export directory")
+        if not folder:
+            return
+        import tempfile
+        output = tempfile.mkdtemp(prefix="qnxprobe-carving-", dir=folder)
+        path = cs["path"]
+        password = state["passwords"].get(path)
+        key = state["aff_keys"].get(path)
+        cs["busy"] = True
+        carve_start["state"] = carve_export["state"] = "disabled"
+        def work():
+            records = []
+            error = None
+            try:
+                with q.open_image(path, password=password, private_key=key) as fh:
+                    for hit in hits:
+                        if stop_carving.is_set():
+                            break
+                        records.append(carving.export_hit(fh, hit, output))
+            except Exception as exc:
+                error = str(exc)
+            try:
+                with open(os.path.join(output, "carving.json"), "x", encoding="utf-8") as out:
+                    json.dump(dict(image=os.path.abspath(path), hits=records,
+                                   cancelled=stop_carving.is_set(), error=error), out, indent=2)
+                cq.put(("done", f"Exported {len(records)} files to {output}" + (f"; {error}" if error else "")))
+            except Exception as exc:
+                cq.put(("error", str(exc)))
+        stop_carving.clear()
+        threading.Thread(target=work, daemon=True).start()
+        root.after(50, poll_carving)
+
+    carve_start = ttk.Button(controls, text="Scan", command=start_carving)
+    carve_start.pack(side="left", padx=6)
+    ttk.Button(controls, text="Stop", command=stop_carving.set).pack(side="left")
+    carve_export = ttk.Button(controls, text="Export selected...", command=export_carving)
+    carve_export.pack(side="left", padx=6)
+
+    def refresh_image_combo():
+        vals = list(images.get(0, "end"))
+        combo["values"] = vals
+        if vals and combo.get() not in vals:
+            combo.set(vals[0])
+        if not vals:
+            combo.set("")
+
+    def append_text(s):
+        text.configure(state="normal")
+        text.insert("end", s)
+        text.see("end")
+        text.configure(state="disabled")
+
+    def clear_text():
+        text.configure(state="normal")
+        text.delete("1.0", "end")
+        text.configure(state="disabled")
+
+    # ---- subprocess driver ------------------------------------------------
+    q_out = queue.Queue()
+    q_con = queue.Queue()
+
+    def build_args(extract):
+        paths = list(images.get(0, "end"))
+        if not paths:
+            messagebox.showinfo("qnxprobe", "Add at least one image first.")
+            return None
+        args = probe_command() + ["--progress"]
+        try:
+            args += ["--scan-limit", str(int(v_scan.get()))]
+            if v_list.get():
+                args += ["--list", "--depth", str(int(v_depth.get())),
+                         "--list-max", str(int(v_max.get()))]
+        except ValueError:
+            messagebox.showerror("qnxprobe", "depth, list-max and scan-limit must be whole numbers.")
+            return None
+        if v_triage.get():
+            args.append("--triage")
+        if v_only.get().strip():
+            args += ["--only", v_only.get().strip()]
+        for x in v_exclude.get().split(","):
+            if x.strip():
+                args += ["--exclude", x.strip()]
+        if extract:
+            zp = v_zip.get().strip()
+            if not zp:
+                messagebox.showinfo("qnxprobe", "Choose where the extraction zip goes.")
+                return None
+            if os.path.exists(zp):
+                messagebox.showerror("qnxprobe", f"Refusing to overwrite an existing file:\n{zp}")
+                return None
+            args += ["--extract", zp]
+        # An encrypted image's password goes to the subprocess in its environment,
+        # never on its command line, where the process list would show it.
+        for path in paths:
+            if not unlock(path) or not unlock_volumes(path):
+                return None
+        env = dict(os.environ)
+        given = [state["passwords"][p] for p in paths if p in state["passwords"]]
+        given += [x for p in paths for x in state["bl_secrets"].get(p, [])]
+        for n, secret in enumerate(given):
+            env[f"QNXPROBE_PASSWORD_{n}"] = secret
+            args += ["--password-env", f"QNXPROBE_PASSWORD_{n}"]
+        for key in sorted({k for p in paths for k in state["bl_keys"].get(p, [])}):
+            args += ["--bitlocker-key", key]
+        for key in sorted({state["aff_keys"][p] for p in paths if p in state["aff_keys"]}):
+            args += ["--private-key", key]
+        state["child_env"] = env
+        return args + paths
+
+    def pump(stream, tag):
+        for line in iter(stream.readline, b""):
+            q_out.put((tag, line.decode("utf-8", "replace")))
+        q_out.put((tag, None))
+
+    def start(extract):
+        args = build_args(extract)
+        if args is None:
+            return
+        clear_text()
+        shown = ["qnxprobe.py"] + args[args.index("--cli") + 1:]
+        append_text("$ " + " ".join(a if " " not in a else f'"{a}"' for a in shown) + "\n\n")
+        progress["value"] = 0
+        status["text"] = "running..."
+        for b in (b_report, b_extract):
+            b["state"] = "disabled"
+        b_cancel["state"] = "normal"
+        try:
+            state["proc"] = subprocess.Popen(args, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                             env=state.pop("child_env", None))
+        except OSError as exc:
+            messagebox.showerror("qnxprobe", f"could not start qnxprobe.py: {exc}")
+            finish()
+            return
+        state["open_streams"] = 2
+        threading.Thread(target=pump, args=(state["proc"].stdout, "out"), daemon=True).start()
+        threading.Thread(target=pump, args=(state["proc"].stderr, "err"), daemon=True).start()
+        root.after(50, poll)
+
+    def poll():
+        try:
+            while True:
+                tag, line = q_out.get_nowait()
+                if line is None:
+                    state["open_streams"] -= 1
+                    continue
+                if tag == "out":
+                    append_text(line)
+                else:
+                    try:
+                        j = json.loads(line)
+                        tb = j.get("total_bytes") or 0
+                        if tb:
+                            progress["value"] = 100.0 * j.get("bytes", 0) / tb
+                        status["text"] = (f"{j.get('volume', '')}: {j.get('files', 0):,} of "
+                                          f"{j.get('total_files', 0):,} files, "
+                                          f"{q.human(j.get('bytes', 0))} of {q.human(tb)}")
+                    except ValueError:
+                        append_text(line)                # stderr that is not progress
+        except queue.Empty:
+            pass
+        p = state["proc"]
+        if p is not None and (p.poll() is None or state["open_streams"] > 0):
+            root.after(50, poll)
+            return
+        rc = p.returncode if p is not None else None
+        finish(rc)
+
+    def finish(rc=None):
+        for b in (b_report, b_extract):
+            b["state"] = "normal"
+        b_cancel["state"] = "disabled"
+        if rc == 0:
+            progress["value"] = 100
+            status["text"] = "done"
+        elif rc is None:
+            status["text"] = "not started"
+        elif rc < 0:
+            status["text"] = "cancelled"
+        else:
+            status["text"] = f"qnxprobe.py exited {rc}"
+        state["proc"] = None
+
+    def cancel():
+        p = state["proc"]
+        if p is not None and p.poll() is None:
+            p.terminate()
+            append_text("\n[cancelled; a partial zip, if any, is not a complete extraction]\n")
+
+    b_report.configure(command=lambda: start(False))
+    b_extract.configure(command=lambda: start(True))
+    b_cancel.configure(command=cancel)
+
+    # ---- contents pane ----------------------------------------------------
+    def close_image():
+        if state["fh"] is not None:
+            try:
+                state["fh"].close()
+            except OSError:
+                pass
+        state.update(fh=None, volumes=[], nodes={}, image_path=None)
+        tree.delete(*tree.get_children())
+        b_save["state"] = "disabled"
+
+    def load_contents():
+        path = combo.get()
+        if not path:
+            messagebox.showinfo("qnxprobe", "Add an image and pick it in the list.")
+            return
+        close_image()
+        b_load["state"] = "disabled"
+        status["text"] = f"reading {os.path.basename(path)} ..."
+
+        if not unlock(path):                 # an encrypted image, its password refused
+            done_loading()
+            return
+        if not unlock_volumes(path):         # a BitLocker or APFS volume's key asked for
+            done_loading()
+            return
+
+        def work():
+            # Tk is not thread safe, so the worker only reads; the result is
+            # picked up by poll_contents() on the main thread.
+            try:
+                fh = q.open_image(path, password=state["passwords"].get(path),
+                                  private_key=state["aff_keys"].get(path))
+                fh, _found = q.unlock_bitlocker(fh, q.image_size(fh),
+                                                state["bl_secrets"].get(path, []),
+                                                state["bl_keys"].get(path, []))
+                fh, _afound = q.unlock_apfs(fh, q.image_size(fh),
+                                            state["bl_secrets"].get(path, []))
+                q_con.put(("ok", path, fh, q.volumes(fh, q.image_size(fh))))
+            except Exception as exc:
+                q_con.put(("err", path, None, str(exc)))
+        threading.Thread(target=work, daemon=True).start()
+        root.after(50, poll_contents)
+
+    def poll_contents():
+        try:
+            kind, path, fh, payload = q_con.get_nowait()
+        except queue.Empty:
+            root.after(50, poll_contents)
+            return
+        if kind == "ok":
+            show_volumes(path, fh, payload)
+        else:
+            messagebox.showerror("qnxprobe", f"could not read {path}:\n{payload}")
+            done_loading()
+
+    def done_loading():
+        b_load["state"] = "normal"
+        status["text"] = "ready"
+
+    def show_volumes(path, fh, vols):
+        state.update(fh=fh, volumes=vols, image_path=path)
+        for i, v in enumerate(vols):
+            label = f"{v['label']}   {v['kind']}   ({v['name']})" if v["name"] else f"{v['label']}   {v['kind']}"
+            if v.get("walker") is not None and v.get("note"):
+                label += f"   [{v['note']}]"     # a walked volume that cannot be read here
+            iid = tree.insert("", "end", text=label,
+                              values=("volume", q.human(v["size"]), v.get("detail", "")[:60], "", "", ""),
+                              open=False)
+            w = v.get("walker")
+            if w is not None:
+                state["nodes"][iid] = (i, w.root, True, None)
+                tree.insert(iid, "end", text="loading...", values=("", "", "", "", "", ""))
+            else:
+                tree.insert(iid, "end", text=v.get("note", "no contents"), values=("", "", "", "", "", ""))
+        done_loading()
+        if not vols:
+            status["text"] = "no partition or volume found in this image"
+
+    def expand(_event=None):
+        iid = tree.focus()
+        node = state["nodes"].get(iid)
+        if node is None or not node[2]:
+            return
+        kids = tree.get_children(iid)
+        if not (len(kids) == 1 and tree.item(kids[0], "text") == "loading..."):
+            return
+        tree.delete(*kids)
+        vi, ino, _isdir, _ = node
+        w = state["volumes"][vi]["walker"]
+        try:
+            readings = hasattr(w, "listdir_records")
+            entries = list(w.listdir_records(ino)) if readings \
+                else [(name, cino, None) for name, cino in w.listdir(ino)]
+        except Exception as exc:
+            tree.insert(iid, "end", text=f"could not list: {exc}", values=("", "", "", "", "", ""))
+            return
+        for name, cino, recorded in entries:
+            ent = w.entry(cino)
+            if not ent:
+                continue
+            mode, size, mtime = ent
+            isdir = (mode & 0o170000) == q.S_IFDIR     # a block device shares the S_IFDIR bit
+            islink = (mode & q.S_IFLNK) == q.S_IFLNK
+            isreg = (mode & 0o170000) == 0o100000
+            kind = "dir" if isdir else "link" if islink else "file" if isreg else "special"
+            created = accessed = 0
+            if hasattr(w, "stamps"):
+                created, _modified, accessed = w.stamps(cino)
+            cid = tree.insert(iid, "end", text=name,
+                              values=(kind, "" if isdir else q.human(size),
+                                      "" if readings else q._fmt_time(mtime),
+                                      q._fmt_time(created) if created else "",
+                                      q._fmt_time(accessed) if accessed else "",
+                                      "; ".join(f"{k} {v}" for k, v in (recorded or {}).items() if v)))
+            state["nodes"][cid] = (vi, cino, isdir, size if isreg else None)
+            if isdir:
+                tree.insert(cid, "end", text="loading...", values=("", "", "", "", "", ""))
+
+    def selected(_event=None):
+        node = state["nodes"].get(tree.focus())
+        b_save["state"] = "normal" if node and not node[2] and node[3] is not None else "disabled"
+
+    def save_file():
+        iid = tree.focus()
+        node = state["nodes"].get(iid)
+        if not node or node[2] or node[3] is None:
+            return
+        vi, ino, _d, size = node
+        w = state["volumes"][vi]["walker"]
+        out = filedialog.asksaveasfilename(title="Save file as", initialfile=tree.item(iid, "text"))
+        if not out:
+            return
+        try:
+            n = 0
+            with open(out, "wb") as f:
+                for chunk in w.read_file(ino, size):
+                    f.write(chunk)
+                    n += len(chunk)
+            status["text"] = f"saved {n:,} bytes to {out}"
+            if n != size:
+                messagebox.showwarning("qnxprobe", f"wrote {n:,} bytes but the entry records {size:,}")
+        except Exception as exc:
+            messagebox.showerror("qnxprobe", f"could not save: {exc}")
+
+    tree.bind("<<TreeviewOpen>>", expand)
+    tree.bind("<<TreeviewSelect>>", selected)
+    tree.bind("<Double-1>", lambda e: save_file() if b_save["state"] == "normal" else None)
+    b_load.configure(command=load_contents)
+    b_save.configure(command=save_file)
+
+    def on_close():
+        stop_carving.set()
+        cancel()
+        close_image()
+        root.destroy()
+
+    root.protocol("WM_DELETE_WINDOW", on_close)
+
+    # Absolute from the start: the subprocess and the frozen build's re-entry
+    # must not depend on whatever the working directory happens to be.
+    for p in initial_paths:
+        if os.path.exists(p):
+            images.insert("end", os.path.abspath(p))
+    refresh_image_combo()
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    argv = sys.argv[1:]
+    if argv and argv[0] == "--cli":
+        run_cli(argv[1:])
+        sys.exit(0)
+    if argv and argv[0] == "--check-discovery":
+        paths = argv[1:]
+        missing = [p for p in paths if not os.path.exists(p)]
+        if not paths or missing:
+            sys.exit("usage: qnxprobe_gui.py --check-discovery IMAGE [IMAGE ...]"
+                     + (f"\nnot found: {', '.join(missing)}" if missing else ""))
+        sys.exit(check_discovery(paths))
+    run_window(argv)
