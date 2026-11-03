@@ -18,3 +18,7 @@ Per-run logical images, profile copies and hash/correction/LBA audit reports are
 retained. BCH correction, stuff/spare removal and explicit optional LBA mapping
 use the existing standard-library NAND engine. Fixed Datalight/FTL100/Qualcomm
 modes remain separate choices.
+
+## WinCE Flash Explorer 1.4.0
+
+Open the Explorer from the QNXProbe GUI for WinCE NAND partition browsing, optional Jacinto ECC correction and MBR export. Missing logical pages retain their offsets and are zero-filled; incomplete exports with missing allocated pages require explicit opt-in.
