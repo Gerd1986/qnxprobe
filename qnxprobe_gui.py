@@ -276,6 +276,20 @@ def run_window(initial_paths):
     ttk.Button(btns, text="Add folder...", command=add_folder).pack(fill="x", pady=(4, 0))
     ttk.Button(btns, text="Remove", command=remove_images).pack(fill="x", pady=(4, 0))
 
+    def open_wince_flash():
+        selected = images.curselection()
+        path = [images.get(selected[0])] if len(selected) == 1 else []
+        launcher = [sys.executable]
+        if not getattr(sys, "frozen", False):
+            launcher.append(os.path.abspath(__file__))
+        try:
+            subprocess.Popen(launcher + ["--wince-flash"] + path)
+        except OSError as exc:
+            messagebox.showerror("WinCE Flash Explorer", str(exc), parent=root)
+
+    ttk.Button(btns, text="WinCE Flash Explorer...",
+               command=open_wince_flash).pack(fill="x", pady=(4, 0))
+
     # ---- options ----------------------------------------------------------
     opts = ttk.LabelFrame(root, text="Options (same as the command line)", padding=8)
     opts.pack(fill="x", padx=8)
@@ -884,6 +898,10 @@ def run_window(initial_paths):
 
 if __name__ == "__main__":
     argv = sys.argv[1:]
+    if argv and argv[0] == "--wince-flash":
+        from wince_flash_explorer import launch_gui
+        launch_gui(argv[1] if len(argv) > 1 else None)
+        sys.exit(0)
     if argv and argv[0] == "--cli":
         run_cli(argv[1:])
         sys.exit(0)
