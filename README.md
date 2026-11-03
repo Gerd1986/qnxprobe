@@ -105,6 +105,13 @@ python3 qnxprobe_gui.py                 # open the window
 python3 qnxprobe_gui.py mmcblk0.img     # open it with an image already added
 ```
 
+On the FTL branch, click **WinCE Flash Explorer...** to open the read-only
+WinCE NAND viewer with partition browsing, optional Jacinto ECC correction,
+and MBR/image export. If exactly one image is selected, the viewer opens that
+image automatically. You can also run
+`python3 qnxprobe_gui.py --wince-flash [dump]`.
+
+
 Add one or more images, set the same options the command line takes, and press
 **Run report** or **Extract to zip**. Both run `qnxprobe.py` as a subprocess and
 stream its output into the Report pane as it is printed, so the report in the
