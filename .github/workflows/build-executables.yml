@@ -4,6 +4,8 @@ on:
   workflow_dispatch:
   pull_request:
   push:
+    branches:
+      - main
     tags:
       - "v*"
 
@@ -268,7 +270,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || (github.ref == 'refs/heads/main' && github.event_name == 'push')
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -289,7 +291,12 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          sed "s/{{VERSION}}/${GITHUB_REF_NAME}/g" packaging/release-notes.md > notes.md
-          gh release create "$GITHUB_REF_NAME" artifacts/* \
-            --title "qnxprobe ${GITHUB_REF_NAME}" \
+          tag="$GITHUB_REF_NAME"
+          if [ "$GITHUB_REF" = "refs/heads/main" ]; then
+            tag="v1.62"
+          fi
+          sed "s/{{VERSION}}/${tag}/g" packaging/release-notes.md > notes.md
+          gh release create "$tag" artifacts/* \
+            --target "$GITHUB_SHA" \
+            --title "qnxprobe ${tag}" \
             --notes-file notes.md
