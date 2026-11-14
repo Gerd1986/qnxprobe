@@ -1,0 +1,33 @@
+name: Publish FTL build 937cd2c
+on:
+  push:
+    branches: [ftl]
+    paths:
+      - .github/workflows/publish-ftl-unallocated.yml
+permissions:
+  contents: write
+  actions: read
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download verified build artifacts
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir -p artifacts
+          gh run download 43586298954 --repo "${{ github.repository }}" --dir artifacts
+          find artifacts -type f -maxdepth 3
+          find artifacts -type f \( -name '*.zip' -o -name '*.tar.gz' \) -exec mv -t artifacts {} +
+          test -n "$(find artifacts -maxdepth 1 -name '*windows-x64.zip' -print -quit)"
+      - name: Publish release from successful FTL build
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd artifacts
+          sha256sum qnxprobe-* > SHA256SUMS.txt
+          gh release create v1.66-ftl qnxprobe-* SHA256SUMS.txt \
+            --repo "${{ github.repository }}" \
+            --target 937cd2cd335a8deeb29c80e057eb6dcead2d1fb0 \
+            --title "qnxprobe v1.66-ftl" \
+            --notes "FTL build with GUI unallocated export (one .bin and .tsv per supported partition). Built and tested by GitHub Actions run 43586298954."
