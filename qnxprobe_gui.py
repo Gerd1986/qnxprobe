@@ -287,6 +287,8 @@ def run_window(initial_paths):
     v_only = tk.StringVar(value="")
     v_exclude = tk.StringVar(value="")
     v_zip = tk.StringVar(value="")
+    v_unallocated = tk.BooleanVar(value=False)
+    v_unallocated_dir = tk.StringVar(value="")
 
     ttk.Checkbutton(opts, text="--list contents", variable=v_list).grid(row=0, column=0, sticky="w")
     ttk.Label(opts, text="--depth").grid(row=0, column=1, sticky="e")
@@ -312,6 +314,19 @@ def run_window(initial_paths):
             v_zip.set(p)
 
     ttk.Button(opts, text="Choose...", command=pick_zip).grid(row=2, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
+    ttk.Checkbutton(opts, text="Export unallocated (one .bin per partition)",
+                    variable=v_unallocated).grid(row=3, column=0, columnspan=3,
+                                                 sticky="w", pady=(6, 0))
+    ttk.Entry(opts, textvariable=v_unallocated_dir).grid(
+        row=3, column=3, columnspan=4, sticky="ew", pady=(6, 0))
+
+    def pick_unallocated_dir():
+        p = filedialog.askdirectory(title="Unallocated output directory")
+        if p:
+            v_unallocated_dir.set(os.path.normpath(p))
+
+    ttk.Button(opts, text="Folder...", command=pick_unallocated_dir).grid(
+        row=3, column=7, sticky="w", pady=(6, 0), padx=(6, 0))
     for c in (1, 5, 6):
         opts.columnconfigure(c, weight=1)
 
@@ -414,6 +429,18 @@ def run_window(initial_paths):
             messagebox.showinfo("qnxprobe", "Add at least one image first.")
             return None
         args = probe_command() + ["--progress"]
+        if v_unallocated.get():
+            folder = v_unallocated_dir.get().strip()
+            if not folder:
+                messagebox.showinfo("qnxprobe", "Choose an output folder for unallocated data.")
+                return None
+            folder = os.path.normpath(os.path.abspath(folder))
+            if os.path.exists(folder):
+                if not os.path.isdir(folder) or os.listdir(folder):
+                    messagebox.showerror("qnxprobe",
+                                         "Unallocated output folder must be new or empty.\\n" + folder)
+                    return None
+            args += ["--unallocated", folder]
         try:
             args += ["--scan-limit", str(int(v_scan.get()))]
             if v_list.get():
