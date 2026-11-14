@@ -15226,7 +15226,12 @@ def self_test():
         fat = bytearray(64 * 1024)
         fat[82:90] = b"FAT32   "
         struct.pack_into("<H", fat, 11, 512); fat[13] = 1
-        struct.pack_into("<I", fat, 32, 96)
+        # Supply a consistent FAT32 BPB, not merely its advisory type string.
+        # The small synthetic image only needs its boot sector inspected.
+        struct.pack_into("<H", fat, 14, 32)     # reserved sectors
+        fat[16] = 2                            # FAT count
+        struct.pack_into("<I", fat, 36, 600)   # FAT sectors
+        struct.pack_into("<I", fat, 32, 140000) # total sectors
         fat[510:512] = b"\x55\xaa"
         fp = os.path.join(d, "fat32.img"); open(fp, "wb").write(fat)
 
